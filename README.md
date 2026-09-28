@@ -21,6 +21,21 @@ These are dated measurements from specific experiments, not a general performanc
 - In a separate `fast4p` comparison with `fast4s`, NLL was +0.8128% and +1.0984% on two texts (991 tokens each; 150-token prefix, 841 continuation tokens scored). A few short JSON, arithmetic, and Japanese prompts were also checked. Earlier longer checks included an unfinished Japanese response and an arithmetic answer that was wrong in both modes; later short-answer checks completed, but these small samples do not establish general task quality.
 - Exact-mode output hashes matched the reference in the tested cases. That claim applies to those checks only.
 
+## Choose a mode
+
+The experimental launcher already accepts these modes by name on the test machine. This repository does not yet include the launcher or modified runtime, so the table is a guide to measured choices, not a runnable download.
+
+| Mode | Decode speed | NLL difference vs. exact | When to choose |
+|---|---:|---:|---|
+| `exact` | ~2.1 tok/s | 0 (reference) | Use the reference path when fidelity is the priority. Output hashes matched the reference in tested cases only. |
+| `jevq6s` | ~3.6 tok/s | +2.03% / +2.06% on two Japanese texts | Quality-priority starting point; the current recommended preset for these tests. |
+| `jevq5s` | ~3.8 tok/s | +3.69% / +3.81% on the same two texts | A little more speed, with a larger measured NLL difference in those texts. |
+| `fast4q` | ~4.5 tok/s | +4.5% in the reported evaluation | Middle-speed option. |
+| `fast4s` | 5.3–5.5 tok/s | +5.98% on one 991-token text (959 scored) | Choose when decode speed matters more. |
+| `fast5` | ~6.7 tok/s | +21.48% on one 991-token text (959 scored) | Highest measured speed in this set; not recommended as the default because of the larger measured NLL difference. |
+
+These are project snapshots from different runs and evaluation conditions, not a single apples-to-apples benchmark. NLL is a language-modeling metric, not a percentage score for answer quality or accuracy; the text evaluations are small. `fast5` is distinct from `fast5s`, a separate experimental mode that was withdrawn after a malformed-output check.
+
 ## How the approximation works
 
 The `jevq6s` mode combines cache-aware expert selection, resident-expert substitution, and next-layer prefetch. The `fast4s` mode can skip selected experts that are not in the memory cache, then use a suitable expert that is already resident. These modes reduce some SSD reads but change the computation. `exact` remains available as the reference mode. Approximate output is not described as lossless.
