@@ -10,6 +10,7 @@ These are dated measurements from specific experiments, not a general performanc
 
 | Experiment | Measured result | Conditions and limits |
 |---|---|---|
+| `jevq6s` decode, 2026-09-28 | 3.62 / 3.59 tok/s across two runs; exact measured about 2.1 tok/s | Experimental approximate mode combining cache-aware MASS, resident-expert substitution, and next-layer prefetch. In separate NLL evaluations, +2.06% vs exact on one Japanese text (959 tokens scored) and +2.03% on another (2,222 tokens scored). These two texts do not establish general response quality. |
 | Exact vs. `fast4s` decode, 2026-09-27 | 1.955 vs. 5.555 generated tokens/s (2.84× ratio of the two-run means) | Same fixed Japanese prompt, 64 generated tokens, 2 runs per mode. `fast4s` is approximate; it substitutes already-resident experts for selected cache-missing experts. This is not an apples-to-apples quality comparison. |
 | `fast4p` prefill, 2026-09-27 | 4.535 → 5.785 input tokens/s (+27.56%); decode stayed at 5.59 → 5.615 output tokens/s | 95-token input, two paired runs. `fast4p` changes prefill behavior while retaining the `fast4s` decode configuration. |
 | Exact-mode memory threshold, 2026-09-28 | 2.135 tokens/s with static weights locked vs. 1.85 tokens/s when they were pageable | Two runs per boundary setting, plus one control run. The normal automatic setting keeps the weights locked; increasing the expert cache past the boundary made things slower. |
@@ -22,7 +23,7 @@ These are dated measurements from specific experiments, not a general performanc
 
 ## How the approximation works
 
-The `fast4s` mode can skip selected experts that are not in the memory cache, then use a suitable expert that is already resident. This reduces some SSD reads, but it changes the computation. `exact` remains available as the reference mode. The project reports these paths separately and does not describe approximate output as lossless.
+The `jevq6s` mode combines cache-aware expert selection, resident-expert substitution, and next-layer prefetch. The `fast4s` mode can skip selected experts that are not in the memory cache, then use a suitable expert that is already resident. These modes reduce some SSD reads but change the computation. `exact` remains available as the reference mode. Approximate output is not described as lossless.
 
 ## Why test another drive?
 
@@ -40,9 +41,11 @@ I will add a concrete funding target after selecting the test hardware and check
 
 ## Reproducibility and scope
 
-Before treating a number as comparable, check its date, model quantization, prompt, token count, run count, decode/prefill phase, and approximation mode. Older and newer runs can use different prompts or storage settings. These are selected project-reported snapshots. I’m preparing a public reproducibility pack with the source changes, setup, measurement conditions, and notes on runs that were corrected or excluded.
+Before treating a number as comparable, check its date, model quantization, prompt, token count, run count, decode/prefill phase, and approximation mode. Older and newer runs can use different prompts or storage settings. These are selected project-reported snapshots.
 
 This is a single-machine research project. Hardware, model quantization, short evaluation texts, and a small set of prompt checks limit what can be concluded. Higher SSD bandwidth may not improve end-to-end inference if another part of the runtime becomes the bottleneck.
+
+This repository currently publishes experiment summaries, not the modified runtime source or reproduction scripts. Those materials are being prepared separately. Before publishing them, I will identify the exact upstream revision, review the patch and bundled notices, and remove private paths or prompts from any logs.
 
 ### Credits
 
