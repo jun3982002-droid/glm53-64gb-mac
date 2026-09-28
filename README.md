@@ -14,12 +14,15 @@ These are dated measurements from specific experiments, not a general performanc
 | Exact vs. `fast4s` decode, 2026-09-27 | 1.955 vs. 5.555 generated tokens/s (2.84× ratio of the two-run means) | Same fixed Japanese prompt, 64 generated tokens, 2 runs per mode. `fast4s` is approximate; it substitutes already-resident experts for selected cache-missing experts. This is not an apples-to-apples quality comparison. |
 | `fast4p` prefill, 2026-09-27 | 4.535 → 5.785 input tokens/s (+27.56%); decode stayed at 5.59 → 5.615 output tokens/s | 95-token input, two paired runs. `fast4p` changes prefill behavior while retaining the `fast4s` decode configuration. |
 | Exact-mode memory threshold, 2026-09-28 | 2.135 tokens/s with static weights locked vs. 1.85 tokens/s when they were pageable | Two runs per boundary setting, plus one control run. The normal automatic setting keeps the weights locked; increasing the expert cache past the boundary made things slower. |
+| Three-model comparison, 2026-09-28 | 24 easier questions: GLM `jevq6s` 24/24, Qwen3.8 Flash Next 22/24, DeepSeek V4.1 Flash 19/24 (18/24 if one truncated answer is counted as wrong). 20 harder questions: Qwen 20/20, GLM `jevq6s` 18/20, DeepSeek 13/20. | Japanese questions, graded automatically, each run once per model; temperature 0, thinking off. The sets are small, so a one- or two-question gap is a tie. Qwen answered roughly 20–50× faster per question. All three were quantized builds, and GLM and DeepSeek ran on experimental SSD-streaming runtimes; these are results as run here, not for the full-precision models. Details: [2026-09-28 results](results/2026-09-28-model-comparison-and-derailment-fix.md) |
+| Derailment in `jevq6s` and a fix, 2026-09-28 | After one specific sequence of 9 earlier questions, `jevq6s` answered a logic puzzle with an unrelated article, and this reproduced exactly. Running the first 16 decode steps of each answer without approximation fixed it (10/10 on the reproducing sequence). | Only one reproduced case. It does not protect later parts of an answer. Cost on 64-token answers: −15% decode speed for `jevq6s` and −30% for `fast4s` (one run each). For `jevq6s` at 256 tokens: −4.4% (two-run mean on the test build). Details: [2026-09-28 results](results/2026-09-28-model-comparison-and-derailment-fix.md) |
 
 ### Quality notes
 
 - In a separate `fast4s` evaluation, NLL was **5.98% higher than exact** on one 991-token text (959 tokens scored). This is a change in one language-modeling metric, not “6% quality loss,” accuracy, or a broad measure of usefulness.
 - In a separate `fast4p` comparison with `fast4s`, NLL was +0.8128% and +1.0984% on two texts (991 tokens each; 150-token prefix, 841 continuation tokens scored). A few short JSON, arithmetic, and Japanese prompts were also checked. Earlier longer checks included an unfinished Japanese response and an arithmetic answer that was wrong in both modes; later short-answer checks completed, but these small samples do not establish general task quality.
 - Exact-mode output hashes matched the reference in the tested cases. That claim applies to those checks only.
+- Approximate modes choose experts partly from what is currently in the memory cache, so the same prompt can give different output depending on earlier requests. NLL averages cannot show rare failures of this kind. One such derailment was reproduced and fixed; see the [2026-09-28 results](results/2026-09-28-model-comparison-and-derailment-fix.md). In those runs, the exact mode did not derail.
 
 ## Choose a mode
 
@@ -36,9 +39,11 @@ The experimental launcher already accepts these modes by name on the test machin
 
 These are project snapshots from different runs and evaluation conditions, not a single apples-to-apples benchmark. NLL is a language-modeling metric, not a percentage score for answer quality or accuracy; the text evaluations are small. `fast5` is distinct from `fast5s`, a separate experimental mode that was withdrawn after a malformed-output check.
 
+The speeds in this table were measured before a start-of-answer safeguard was added. The launcher now runs the first 16 decode steps of each answer exactly in the approximate modes on the patched runtime (`fast4p` runs on a separate binary and is not covered). This lowers speed mostly for short answers. On 64-token answers, it cost about 15% for `jevq6s` and 30% for `fast4s` (one run each: 3.85 → 3.28 and 5.54 → 3.88 tok/s). The 3.85 differs from the ~3.6 in the table: with the same settings, `jevq6s` measured 3.59–3.62 tok/s in an earlier session and 3.85–3.86 tok/s in a later one, and the cause of that gap was not found.
+
 ## How the approximation works
 
-The `jevq6s` mode combines cache-aware expert selection, resident-expert substitution, and next-layer prefetch. The `fast4s` mode can skip selected experts that are not in the memory cache, then use a suitable expert that is already resident. These modes reduce some SSD reads but change the computation. `exact` remains available as the reference mode. Approximate output is not described as lossless.
+The `jevq6s` mode combines cache-aware expert selection, resident-expert substitution, and next-layer prefetch. The `fast4s` mode can skip selected experts that are not in the memory cache, then use a suitable expert that is already resident. These modes reduce some SSD reads but change the computation. `exact` remains available as the reference mode. Approximate output is not described as lossless. Because the choice depends on the cache contents, approximate output can depend on earlier requests, not only on the prompt. In the launcher used for these tests (not yet published), the approximate modes now run the first 16 decode steps of each answer without approximation, to protect the start of the answer; `fast4p` runs on a separate binary and is not covered (see the [2026-09-28 results](results/2026-09-28-model-comparison-and-derailment-fix.md)).
 
 ## Why test another drive?
 
@@ -60,7 +65,7 @@ Before treating a number as comparable, check its date, model quantization, prom
 
 This is a single-machine research project. Hardware, model quantization, short evaluation texts, and a small set of prompt checks limit what can be concluded. Higher SSD bandwidth may not improve end-to-end inference if another part of the runtime becomes the bottleneck.
 
-This repository currently publishes experiment summaries, not the modified runtime source or reproduction scripts. Those materials are being prepared separately. Before publishing them, I will identify the exact upstream revision, review the patch and bundled notices, and remove private paths or prompts from any logs.
+This repository currently publishes experiment summaries and, for the 2026-09-28 model comparison, the question sets ([results/eval-sets/](results/eval-sets/)). It does not yet include the modified runtime source or reproduction scripts; those are being prepared separately. Before publishing them, I will identify the exact upstream revision, review the patch and bundled notices, and remove private paths or prompts from any logs.
 
 ### Credits
 

@@ -1,0 +1,201 @@
+[
+  {
+    "id": "math-1",
+    "category": "math",
+    "max_tokens": 256,
+    "prompt": "りんごが1個120円、みかんが1個80円です。りんごを3個、みかんを5個買うと合計は何円ですか。答えだけを数字で書いてください。",
+    "grading": {"type": "int", "answer": 760}
+  },
+  {
+    "id": "math-2",
+    "category": "math",
+    "max_tokens": 256,
+    "prompt": "太郎君は分速80mで歩きます。1.2km先の駅まで歩くと何分かかりますか。答えだけを数字で書いてください。",
+    "grading": {"type": "int", "answer": 15}
+  },
+  {
+    "id": "math-3",
+    "category": "math",
+    "max_tokens": 256,
+    "prompt": "ある学校の生徒数は男子が180人、女子は男子より45人少ないです。生徒の合計は何人ですか。答えだけを数字で書いてください。",
+    "grading": {"type": "int", "answer": 315}
+  },
+  {
+    "id": "math-4",
+    "category": "math",
+    "max_tokens": 256,
+    "prompt": "定価2000円の商品を20%引きで販売し、さらに送料300円が別途かかります。支払い総額は何円ですか。答えだけを数字で書いてください。",
+    "grading": {"type": "int", "answer": 1900}
+  },
+  {
+    "id": "math-5",
+    "category": "math",
+    "max_tokens": 256,
+    "prompt": "100以上999以下の3桁の自然数のうち、7の倍数は何個ありますか。答えだけを数字で書いてください。",
+    "grading": {"type": "int", "answer": 128}
+  },
+  {
+    "id": "math-6",
+    "category": "math",
+    "max_tokens": 256,
+    "prompt": "時速60kmで走る車が45分走ると何km進みますか。答えだけを数字で書いてください。",
+    "grading": {"type": "int", "answer": 45}
+  },
+  {
+    "id": "logic-1",
+    "category": "logic",
+    "max_tokens": 256,
+    "prompt": "AはBより背が高い。BはCより背が高い。DはAより背が高い。この4人の中で最も背が高いのは誰ですか。アルファベット1文字だけで答えてください。",
+    "grading": {"type": "str_ci", "answers": ["D"]}
+  },
+  {
+    "id": "logic-2",
+    "category": "logic",
+    "max_tokens": 256,
+    "prompt": "赤、青、黄の3枚のカードが横一列に並んでいます。赤は青より左にあります。黄は赤より左にあります。左から並んでいる順に見たとき、真ん中にあるのはどの色ですか。色の名前だけを1語で答えてください。",
+    "grading": {"type": "str_ci", "answers": ["赤", "赤色", "あか"]}
+  },
+  {
+    "id": "logic-3",
+    "category": "logic",
+    "max_tokens": 256,
+    "prompt": "ある家族に子供が3人います。次郎は花子より年上で、花子は太郎より年上です。3人のうち一番年下は誰ですか。名前だけを答えてください。",
+    "grading": {"type": "str_ci", "answers": ["太郎"]}
+  },
+  {
+    "id": "logic-4",
+    "category": "logic",
+    "max_tokens": 256,
+    "prompt": "5人が参加するトーナメントで、2人ずつ対戦して負けた方が抜けていき、最後に残った1人が優勝します。不戦勝はなく、優勝者が決まるまでに最低何回の対戦が必要ですか。数字だけで答えてください。",
+    "grading": {"type": "int", "answer": 4}
+  },
+  {
+    "id": "logic-5",
+    "category": "logic",
+    "max_tokens": 256,
+    "prompt": "ある暗号では、アルファベットを1文字ずつ次の文字にずらして書きます（例えば A は B、Z は A になります）。この規則で「APPLE」は「BQQMF」と書けます。同じ規則で「LEMON」はどう書きますか。答えだけを大文字のアルファベットで書いてください。",
+    "grading": {"type": "str_ci", "answers": ["MFNPO"]}
+  },
+  {
+    "id": "jp-1",
+    "category": "japanese",
+    "max_tokens": 256,
+    "prompt": "漢字「憂鬱」の読み方をひらがなで、答えだけ書いてください。",
+    "grading": {"type": "str_ci", "answers": ["ゆううつ"]}
+  },
+  {
+    "id": "jp-2",
+    "category": "japanese",
+    "max_tokens": 256,
+    "prompt": "ことわざ「猿も木から落ちる」の意味を一言で説明してください。",
+    "grading": {"type": "keyword_groups", "groups": [["得意", "名人", "上手", "熟練", "達人"], ["失敗", "ミス", "間違え", "落ちる", "しくじる"]]}
+  },
+  {
+    "id": "jp-3",
+    "category": "japanese",
+    "max_tokens": 256,
+    "prompt": "「言う」を尊敬語に言い換えてください。答えだけを一語で書いてください。",
+    "grading": {"type": "keyword_groups", "groups": [["おっしゃる"]]}
+  },
+  {
+    "id": "jp-4",
+    "category": "japanese",
+    "max_tokens": 256,
+    "prompt": "「見る」を謙譲語に言い換えてください。答えだけを一語で書いてください。",
+    "grading": {"type": "keyword_groups", "groups": [["拝見"]]}
+  },
+  {
+    "id": "general-1",
+    "category": "general",
+    "max_tokens": 128,
+    "prompt": "日本の首都はどこですか。答えだけを書いてください。",
+    "grading": {"type": "str_ci", "answers": ["東京", "東京都"]}
+  },
+  {
+    "id": "general-2",
+    "category": "general",
+    "max_tokens": 128,
+    "prompt": "水の化学式は何ですか。答えだけを書いてください。",
+    "grading": {"type": "str_ci", "answers": ["H2O", "H₂O"]}
+  },
+  {
+    "id": "general-3",
+    "category": "general",
+    "max_tokens": 128,
+    "prompt": "平年（うるう年でない年）は1年は何日ですか。数字だけで答えてください。",
+    "grading": {"type": "int", "answer": 365}
+  },
+  {
+    "id": "json-1",
+    "category": "json",
+    "max_tokens": 256,
+    "prompt": "次の情報をJSONオブジェクトで出力してください。キーは \"name\"(文字列), \"age\"(整数), \"is_student\"(真偽値)。値は name=\"Kuro\", age=3, is_student=true です。説明文は付けず、JSONオブジェクトのみを出力してください。",
+    "grading": {"type": "json_schema", "schema": {"name": {"type": "str", "equals": "Kuro"}, "age": {"type": "int", "equals": 3}, "is_student": {"type": "bool", "equals": true}}}
+  },
+  {
+    "id": "json-2",
+    "category": "json",
+    "max_tokens": 256,
+    "prompt": "1から5までの整数を含む配列を、キー \"numbers\" を持つJSONオブジェクトとして出力してください。他のキーは含めないでください。説明文は付けず、JSONオブジェクトのみを出力してください。",
+    "grading": {"type": "json_schema", "schema": {"numbers": {"type": "list_int", "equals": [1, 2, 3, 4, 5]}}}
+  },
+  {
+    "id": "json-3",
+    "category": "json",
+    "max_tokens": 256,
+    "prompt": "りんご=120円、みかん=80円、ばなな=100円です。この3つの果物と価格を、キー \"items\" に配列として持つJSONオブジェクトで出力してください。配列の各要素は \"name\"(文字列) と \"price\"(整数) をキーに持つオブジェクトにしてください。説明文は付けず、JSONオブジェクトのみを出力してください。",
+    "grading": {"type": "json_schema", "schema": {"items": {"type": "list_items", "equals": [{"name": "りんご", "price": 120}, {"name": "みかん", "price": 80}, {"name": "ばなな", "price": 100}]}}}
+  },
+  {
+    "id": "code-1",
+    "category": "code",
+    "max_tokens": 512,
+    "prompt": "Pythonで、与えられた整数nが素数ならTrue、そうでなければFalseを返す関数 is_prime(n) を書いてください。説明文は付けず、コードブロックのみを出力してください。",
+    "grading": {
+      "type": "code_test",
+      "func_name": "is_prime",
+      "tests": [
+        {"args": [2], "expected": true},
+        {"args": [1], "expected": false},
+        {"args": [17], "expected": true},
+        {"args": [18], "expected": false},
+        {"args": [0], "expected": false},
+        {"args": [-5], "expected": false},
+        {"args": [97], "expected": true}
+      ]
+    }
+  },
+  {
+    "id": "code-2",
+    "category": "code",
+    "max_tokens": 512,
+    "prompt": "Pythonで、文字列を受け取り、単語の並び順を逆にして返す関数 reverse_words(s) を書いてください。例えば \"hello world\" は \"world hello\" になります。単語はスペースで区切られているとします。説明文は付けず、コードブロックのみを出力してください。",
+    "grading": {
+      "type": "code_test",
+      "func_name": "reverse_words",
+      "tests": [
+        {"args": ["hello world"], "expected": "world hello"},
+        {"args": ["a b c"], "expected": "c b a"},
+        {"args": ["single"], "expected": "single"},
+        {"args": ["one two three four"], "expected": "four three two one"}
+      ]
+    }
+  },
+  {
+    "id": "code-3",
+    "category": "code",
+    "max_tokens": 512,
+    "prompt": "Pythonで、0始まりでn番目のフィボナッチ数を返す関数 fibonacci(n) を書いてください（fibonacci(0)=0, fibonacci(1)=1）。説明文は付けず、コードブロックのみを出力してください。",
+    "grading": {
+      "type": "code_test",
+      "func_name": "fibonacci",
+      "tests": [
+        {"args": [0], "expected": 0},
+        {"args": [1], "expected": 1},
+        {"args": [5], "expected": 5},
+        {"args": [10], "expected": 55},
+        {"args": [15], "expected": 610}
+      ]
+    }
+  }
+]
