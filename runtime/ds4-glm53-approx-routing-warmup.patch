@@ -1,0 +1,1010 @@
+DS4 patch: GLM-5.3 approximate expert routing with an exact warm-up
+(DS4_GLM_APPROX_WARMUP_TOKENS).
+
+Base: https://github.com/antirez/ds4 commit 0aaea5a238fb41a35106a551e73c8409dfb751ac
+Apply from a checkout of that commit:
+    git apply ds4-glm53-approx-routing-warmup.patch
+
+Released under the MIT License, the same license as upstream DS4. LICENSE in
+this directory is the upstream DS4 license file, unchanged.
+See README.md in this directory for what the patch contains, the checks
+that were run, and its limitations.
+
+diff --git a/ds4.c b/ds4.c
+index af13cc8..ac08b6f 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -23125,7 +23125,8 @@ static bool metal_graph_decode_set_hash_selected_override(
+         if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                     &table,
+                     selected_i32,
+-                    DS4_N_EXPERT_USED) == 0) {
++                    DS4_N_EXPERT_USED,
++                    NULL /* early-load path without router weights: MASS not applied here */) == 0) {
+             return false;
+         }
+     }
+@@ -23305,7 +23306,8 @@ static bool metal_graph_decode_selected_readahead_override(
+     if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                 &table,
+                 selected_ids,
+-                DS4_N_EXPERT_USED) == 0) {
++                DS4_N_EXPERT_USED,
++                NULL /* early-load path without router weights: MASS not applied here */) == 0) {
+         return false;
+     }
+     if (ds4_gpu_begin_commands() == 0) return false;
+@@ -23566,7 +23568,8 @@ static void metal_graph_selected_async_load_run(
+     if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                 &table,
+                 job->selected_ids,
+-                DS4_N_EXPERT_USED) == 0) {
++                DS4_N_EXPERT_USED,
++                NULL /* early-load path without router weights: MASS not applied here */) == 0) {
+         return;
+     }
+ 
+@@ -26956,7 +26959,8 @@ static bool metal_graph_encode_decode_layer_phase(
+                     ds4_gpu_stream_expert_cache_begin_selected_load(
+                             &retry_table,
+                             async_load.selected_ids,
+-                            DS4_N_EXPERT_USED) != 0 &&
++                            DS4_N_EXPERT_USED,
++                            NULL /* early-load path without router weights: MASS not applied here */) != 0 &&
+                     ds4_gpu_routed_moe_set_selected_override(
+                             async_load.selected_ids,
+                             DS4_N_EXPERT_USED) != 0;
+@@ -26984,7 +26988,8 @@ static bool metal_graph_encode_decode_layer_phase(
+                 ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                             &table,
+                             selected_ids,
+-                            DS4_N_EXPERT_USED) != 0;
++                            DS4_N_EXPERT_USED,
++                            NULL /* early-load path without router weights: MASS not applied here */) != 0;
+             }
+         }
+         if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+@@ -49046,7 +49051,8 @@ static bool glm_graph_encode_sparse_ffn_one(
+                 ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                         &table,
+                         g->router_selected,
+-                        DS4_N_EXPERT_USED) != 0;
++                        DS4_N_EXPERT_USED,
++                        g->router_weights) != 0;
+             }
+             if (async_profile) {
+                 g_glm_streaming_async_profile.sync_early_load_ms +=
+@@ -51619,7 +51625,8 @@ static bool glm_graph_mtp_step(
+                 .down_expert_bytes = down_out * down_row_bytes,
+             };
+             ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+-                    &table, g->router_selected, DS4_N_EXPERT_USED) != 0;
++                    &table, g->router_selected, DS4_N_EXPERT_USED,
++                    g->router_weights) != 0;
+         }
+ #endif
+         const bool tp_split = g->tp_world == 2 && g->tp_out && g->tp_in;
+@@ -56994,7 +57001,8 @@ static int glm_metal_first_token_logits(
+                 ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                         &table,
+                         router_selected,
+-                        DS4_N_EXPERT_USED) != 0;
++                        DS4_N_EXPERT_USED,
++                        router_weights) != 0;
+             }
+             ds4_glm_gpu_graph route_g = {
+                 .routed_gate = routed_gate,
+@@ -57287,6 +57295,8 @@ static int generate_glm_metal_argmax(
+     int n_decode_eval = 0;
+     uint32_t pos = (uint32_t)prompt->len;
+     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
++    // Start of a generation for DS4_GLM_APPROX_WARMUP_TOKENS (see ds4_metal.m).
++    ds4_glm_approx_warmup_reset();
+     const double t_decode0 = now_sec();
+     for (int i = 0; i < n_predict && pos < g.ctx_size; i++) {
+         if (getenv("DS4_TRACE_TOP") != NULL) {
+@@ -57313,6 +57323,8 @@ static int generate_glm_metal_argmax(
+             glm_graph_free(&g);
+             return 1;
+         }
++        // One decode eval just ran; advance the warm-up step counter.
++        ds4_glm_approx_warmup_note_step();
+         if (token_timing) {
+             const double t_eval1 = now_sec();
+             fprintf(stderr,
+@@ -57334,6 +57346,14 @@ static int generate_glm_metal_argmax(
+             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+ 
++    {
++        const uint64_t warmup_forced = ds4_glm_approx_warmup_forced_this_gen();
++        if (warmup_forced > 0) {
++            fprintf(stderr,
++                    "ds4: GLM approx-warmup: forced exact for %llu/%d decode step(s) this generation\n",
++                    (unsigned long long)warmup_forced, n_decode_eval);
++        }
++    }
+     if (memory_report) ds4_gpu_print_memory_report("before GLM graph free");
+     free(logits);
+     glm_graph_free(&g);
+@@ -66401,7 +66421,8 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+             ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                     &table,
+                     router_selected,
+-                    DS4_N_EXPERT_USED) != 0;
++                    DS4_N_EXPERT_USED,
++                    router_weights) != 0;
+             if (ok) {
+                 layer_glm_routed_moe_one_f32_ref(cpu_sparse_moe,
+                                                  cpu_sparse_mid,
+@@ -66706,7 +66727,8 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+                 ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                         &table,
+                         router_selected,
+-                        DS4_N_EXPERT_USED) != 0;
++                        DS4_N_EXPERT_USED,
++                        router_weights) != 0;
+             }
+             ds4_glm_gpu_graph route_g = {
+                 .routed_gate = routed_gate,
+diff --git a/ds4.h b/ds4.h
+index 49a172d..a8c87ae 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -528,6 +528,16 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
+ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
+ int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
+ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
++/* DS4_GLM_APPROX_WARMUP_TOKENS=N (default 0 = off), implemented in
++ * ds4_metal.m: the approximate expert routing (DS4_GLM_CACHE_AWARE_MIN/
++ * _TAU/_MASS and DS4_GLM_SUBST) is turned off for the first N decode steps
++ * of a generation. Call ds4_glm_approx_warmup_reset() once before the first
++ * decode eval of a generation and ds4_glm_approx_warmup_note_step() once
++ * after each decode eval. ds4_glm_approx_warmup_forced_this_gen() returns how
++ * many decode steps since the last reset ran forced-exact. */
++void ds4_glm_approx_warmup_reset(void);
++void ds4_glm_approx_warmup_note_step(void);
++uint64_t ds4_glm_approx_warmup_forced_this_gen(void);
+ /* Pay the one-time first-submission GPU cost outside any measured window;
+  * used by the TP worker right after session create (no-op on CPU/GLM). */
+ void ds4_session_gpu_warmup(ds4_session *s);
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index a4c76a5..99f65a9 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -381,11 +381,13 @@ int ds4_gpu_stream_expert_cache_seed_selected(
+ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         const ds4_gpu_stream_expert_table *table,
+         const int32_t                     *selected_ids,
+-        uint32_t                           n_selected);
++        uint32_t                           n_selected,
++        const float                       *weights_prescale);
+ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+         const ds4_gpu_stream_expert_table *table,
+         const ds4_gpu_tensor              *selected,
+-        uint32_t                           n_selected);
++        uint32_t                           n_selected,
++        const ds4_gpu_tensor              *weights);
+ #ifdef __APPLE__
+ /* The async selected-load worker registers itself so Metal cache paths never
+  * wait on command buffers from that thread (they fail the load instead and
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 16ae514..52b91d8 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -6487,6 +6487,234 @@ static int ds4_gpu_encode_rope_tail_inplace(
+     uint32_t pad0;
+ } ds4_gpu_glm_router_select_one_args;
+ 
++// GLM-5.3 approximate expert routing (experimental). Every switch below is
++// off by default; with all of them unset, decoding is unchanged. Values are
++// read from the environment once and cached.
++static uint32_t ds4_glm_fast_routing_env_u32(const char *name) {
++    const char *env = getenv(name);
++    if (!env || !env[0]) return 0;
++    char *end = NULL;
++    long v = strtol(env, &end, 10);
++    if (end == env || *end != '\0' || v <= 0 || v > 256) return 0;
++    return (uint32_t)v;
++}
++
++// DS4_GLM_APPROX_WARMUP_TOKENS=N (default 0 = off) turns the approximate
++// routing below (DS4_GLM_CACHE_AWARE_MIN/_TAU/_MASS and DS4_GLM_SUBST) off
++// for the first N decode steps of every generation, so those steps make the
++// same expert selection as exact decoding; the approximation resumes from
++// step N onward. The approximate modes decide what to drop or substitute
++// partly from the current expert-cache contents, and those depend on
++// earlier requests. In one reproduced case, a particular request history
++// made the approximation derail an answer from its second generated token;
++// making the first decode steps exact fixed that case. Next-layer prefetch
++// and other cache behavior are not affected by this switch.
++//
++// Steps are counted with one file-scope counter. That is correct as long as
++// only one generation decodes at a time in the process: the CLI decode loop,
++// and ds4-server in its default mode, where decoding is serialized by its
++// inference mutex. With --batched-sessions the server decodes several
++// sessions concurrently and they would share this counter, so the warm-up
++// window is not tracked correctly in that mode.
++//
++// ds4_glm_approx_warmup_reset() is called once at the start of a generation
++// and ds4_glm_approx_warmup_note_step() once after each decode eval, in
++// ds4.c generate_glm_metal_argmax() (CLI generation) and ds4_server.c
++// generate_job_inner() (one HTTP request). Other paths, including perplexity
++// scoring, are not wired; there the counter stays at 0, so with the variable
++// set every step is exact.
++static uint32_t ds4_glm_approx_warmup_tokens(void) {
++    static int checked = 0;
++    static uint32_t v = 0;
++    if (!checked) {
++        v = ds4_glm_fast_routing_env_u32("DS4_GLM_APPROX_WARMUP_TOKENS");
++        checked = 1;
++    }
++    return v;
++}
++
++static uint32_t g_glm_approx_warmup_step = 0;
++
++// True while the current decode step is inside the warm-up window (step < N).
++static int ds4_glm_approx_warmup_active(void) {
++    const uint32_t n = ds4_glm_approx_warmup_tokens();
++    return n != 0 && g_glm_approx_warmup_step < n;
++}
++
++// Call once at the start of every generation.
++void ds4_glm_approx_warmup_reset(void) {
++    g_glm_approx_warmup_step = 0;
++}
++
++// Call once after each decode eval (one generated token). It must run after
++// the eval, because the getters below read the counter during the eval.
++void ds4_glm_approx_warmup_note_step(void) {
++    g_glm_approx_warmup_step++;
++}
++
++// Number of decode steps since the last reset that ran forced-exact.
++uint64_t ds4_glm_approx_warmup_forced_this_gen(void) {
++    const uint32_t n = ds4_glm_approx_warmup_tokens();
++    return g_glm_approx_warmup_step < n ? g_glm_approx_warmup_step : n;
++}
++
++// DS4_GLM_CACHE_AWARE_MIN=m. Applies to the single-token decode MoE path
++// (ds4_gpu_routed_moe_one_tensor). Slots ranked < m always load. A slot
++// ranked >= m is used only if its expert is already in the streaming expert
++// cache; a cache miss there is dropped (no SSD read) and aliased to slot 0
++// with weight 0. 0 (unset) = off.
++static uint32_t ds4_glm_cache_aware_min_m(void) {
++    // Forced off during the warm-up window.
++    if (ds4_glm_approx_warmup_active()) return 0;
++    static int checked = 0;
++    static uint32_t v = 0;
++    if (!checked) {
++        v = ds4_glm_fast_routing_env_u32("DS4_GLM_CACHE_AWARE_MIN");
++        checked = 1;
++    }
++    return v;
++}
++
++// DS4_GLM_CACHE_AWARE_TAU=tau. A missing slot ranked >= m is loaded instead
++// of dropped if its normalized router weight (before the router's
++// expert_weight_scale multiply) is >= tau. The weights buffer holds the
++// scaled value, so the comparison is stored_weight >= tau *
++// DS4_GLM_EXPERT_WEIGHT_SCALE. 0 (unset) disables the rescue.
++#define DS4_GLM_EXPERT_WEIGHT_SCALE 2.5f
++static float ds4_glm_cache_aware_tau(void) {
++    // Forced off during the warm-up window.
++    if (ds4_glm_approx_warmup_active()) return 0.0f;
++    static int checked = 0;
++    static float v = 0.0f;
++    if (!checked) {
++        const char *env = getenv("DS4_GLM_CACHE_AWARE_TAU");
++        if (env && env[0]) {
++            char *end = NULL;
++            double parsed = strtod(env, &end);
++            if (end != env && *end == '\0' && parsed > 0.0 && parsed < 1.0) {
++                v = (float)parsed;
++            }
++        }
++        checked = 1;
++    }
++    return v;
++}
++
++// DS4_GLM_CACHE_AWARE_MASS=p (0 < p <= 1; unset = off): mass-coverage drop.
++// When set, it replaces DS4_GLM_CACHE_AWARE_MIN/_TAU entirely. See
++// ds4_glm_cache_aware_mass_select() for the rule.
++static float ds4_glm_cache_aware_mass_p(void) {
++    // Forced off during the warm-up window.
++    if (ds4_glm_approx_warmup_active()) return 0.0f;
++    static int checked = 0;
++    static float v = 0.0f;
++    if (!checked) {
++        const char *env = getenv("DS4_GLM_CACHE_AWARE_MASS");
++        if (env && env[0]) {
++            char *end = NULL;
++            double parsed = strtod(env, &end);
++            if (end != env && *end == '\0' && parsed > 0.0 && parsed <= 1.0) {
++                v = (float)parsed;
++            }
++        }
++        checked = 1;
++    }
++    return v;
++}
++
++// Mass-coverage slot selection, shared by the early-load path
++// (ds4_gpu_stream_expert_cache_begin_selected_load, residency from its own
++// cache lookup) and the consumption path (ds4_gpu_routed_moe_one_tensor,
++// freshly peeked residency). Resident slots always count toward the used
++// router-weight mass. Missing slots are kept in rank order while that mass
++// is below p, and dropped after; rank 0 is always kept. ids[] must be in
++// rank order. Returns the bitmask of slots to drop (weight 0 + alias).
++static uint32_t ds4_glm_cache_aware_mass_select(
++        float p,
++        uint32_t n_expert,
++        uint32_t resident_mask,
++        uint32_t missing_mask,
++        const float *weights_prescale) {
++    if (p <= 0.0f || p > 1.0f || n_expert == 0) return 0;
++    float mass_used = 0.0f;
++    for (uint32_t i = 0; i < n_expert; i++) {
++        if ((resident_mask & (1u << i)) != 0) {
++            mass_used += weights_prescale[i];
++        }
++    }
++    uint32_t dropped = 0;
++    for (uint32_t i = 0; i < n_expert; i++) {
++        if ((missing_mask & (1u << i)) == 0) continue; // resident, already counted
++        if (i == 0) {
++            // rank 0 (top-1) is always used.
++            mass_used += weights_prescale[0];
++            continue;
++        }
++        if (mass_used < p) {
++            mass_used += weights_prescale[i];
++        } else {
++            dropped |= (1u << i);
++        }
++    }
++    return dropped;
++}
++
++// DS4_GLM_SUBST=router. For each slot the cache-aware drop above decided to
++// drop, use instead the already-cached expert (no extra SSD read; the lookup
++// is ds4_gpu_stream_expert_cache_peek()) with the highest raw router
++// probability that is not already used by this token's other slots or
++// claimed by an earlier substitute. The dropped slot's own normalized weight
++// is kept for the substitute. If no candidate is cached, the slot falls back
++// to the alias-to-slot-0 / weight-0 behavior. Unset = off.
++typedef enum {
++    DS4_GLM_SUBST_OFF    = 0,
++    DS4_GLM_SUBST_ROUTER = 1,
++} ds4_glm_subst_mode_t;
++
++static ds4_glm_subst_mode_t ds4_glm_subst_mode(void) {
++    // Forced off during the warm-up window. SUBST only acts on slots the drop
++    // logic dropped, which is already off then; this keeps it explicit.
++    if (ds4_glm_approx_warmup_active()) return DS4_GLM_SUBST_OFF;
++    static int checked = 0;
++    static ds4_glm_subst_mode_t mode = DS4_GLM_SUBST_OFF;
++    if (!checked) {
++        checked = 1;
++        const char *env = getenv("DS4_GLM_SUBST");
++        if (env && env[0]) {
++            if (strcmp(env, "router") == 0) mode = DS4_GLM_SUBST_ROUTER;
++        }
++    }
++    return mode;
++}
++
++// Recorded by ds4_gpu_glm_router_select_tensor() (the single-token decode
++// router), only when DS4_GLM_SUBST is on, and read by
++// ds4_gpu_routed_moe_one_tensor for the same layer later in the same token's
++// single-threaded dispatch.
++static ds4_gpu_tensor *g_glm_subst_router_probs_tensor = NULL;
++static uint32_t         g_glm_subst_router_probs_n_expert = 0;
++
++static void ds4_glm_subst_note_router_probs(ds4_gpu_tensor *probs, uint32_t n_expert) {
++    g_glm_subst_router_probs_tensor = probs;
++    g_glm_subst_router_probs_n_expert = n_expert;
++}
++
++// CPU-visible pointer to the n_expert raw sigmoid probabilities from the most
++// recent decode router call, or NULL if unavailable. The probs buffer is
++// shared storage, and the router's command buffer has already completed when
++// the drop path reaches this point, so no extra synchronization is needed.
++static const float *ds4_glm_subst_router_probs_ptr(uint32_t want_n_expert) {
++    if (!g_glm_subst_router_probs_tensor ||
++        g_glm_subst_router_probs_n_expert < want_n_expert) {
++        return NULL;
++    }
++    id<MTLBuffer> pb = ds4_gpu_tensor_buffer(g_glm_subst_router_probs_tensor);
++    if (!pb) return NULL;
++    uint8_t *base = (uint8_t *)[pb contents];
++    if (!base) return NULL;
++    return (const float *)(base + ds4_gpu_tensor_offset(g_glm_subst_router_probs_tensor));
++}
++
+ typedef struct {
+     uint32_t n_tokens;
+     uint32_t kv_raw_dim;
+@@ -13264,6 +13492,11 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
+     uint32_t n_total_expert;
+     uint32_t n_selected;
+     uint32_t missing_mask;
++    // Slots whose load the cache-aware drop skipped in
++    // ds4_gpu_stream_expert_cache_begin_selected_load(). Carried through
++    // ds4_gpu_glm_stream_selected_prefetch so ds4_gpu_routed_moe_one_tensor
++    // knows which slots to alias.
++    uint32_t dropped_mask;
+     uint32_t load_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+     uint32_t source_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+     uint32_t n_loads;
+@@ -13300,6 +13533,9 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
+     uint64_t gate_expert_bytes;
+     uint64_t down_expert_bytes;
+     int32_t selected_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
++    // Slots the early-load path dropped (see
++    // ds4_gpu_stream_expert_pending_load.dropped_mask).
++    uint32_t dropped_mask;
+ } ds4_gpu_glm_stream_selected_prefetch;
+ 
+ static ds4_gpu_glm_stream_selected_prefetch g_glm_stream_selected_prefetch;
+@@ -16477,9 +16713,15 @@ static int ds4_gpu_stream_expert_pending_load_matches(
+ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         const ds4_gpu_stream_expert_table *table,
+         const int32_t                     *selected_ids,
+-        uint32_t                           n_selected) {
++        uint32_t                           n_selected,
++        // Router weights before the expert_weight_scale multiply, in the
++        // same rank order as selected_ids, or NULL when the caller has none.
++        // Lets DS4_GLM_CACHE_AWARE_MASS skip a read before it is issued.
++        const float                       *weights_prescale) {
+     if (!g_ssd_streaming_mode ||
+         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
++        // No drop decision was made here; clear any stale mask.
++        g_stream_expert_pending_load.dropped_mask = 0;
+         return 1;
+     }
+     if (!table) return 0;
+@@ -16503,6 +16745,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         ds4_gpu_stream_expert_cache_effective_cap(layer,
+                                                   n_total_expert,
+                                                   n_selected) == 0) {
++        g_stream_expert_pending_load.dropped_mask = 0;
+         return 1;
+     }
+     if (!g_initialized && !ds4_gpu_init()) return 0;
+@@ -16527,6 +16770,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
+     p->n_total_expert = n_total_expert;
+     p->n_selected = n_selected;
+     p->missing_mask = 0;
++    p->dropped_mask = 0;
+     p->n_loads = 0;
+     p->n_tasks = 0;
+     p->gate_expert_bytes = gate_expert_bytes;
+@@ -16611,6 +16855,58 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         p->missing_mask |= 1u << i;
+         p->load_slots[p->n_loads++] = i;
+     }
++
++    // Cache-aware drop in the early-load path. With DS4_GLM_CACHE_AWARE_MASS
++    // set, the mass-coverage rule decides; residency here comes from this
++    // function's own cache lookup above (a slot not in missing_mask already
++    // matched a live cache entry). Otherwise, with DS4_GLM_CACHE_AWARE_MIN=m,
++    // a missing slot is dropped only if its resolved source slot
++    // (source_slots[i]) is ranked >= m, because a duplicate of a lower-ranked
++    // slot still gets its data from that slot's load. TAU is not applied here
++    // (no weights); ds4_gpu_routed_moe_one_tensor applies it later and falls
++    // back to a synchronous load for a rescued slot.
++    {
++        const float cache_aware_mass_p = ds4_glm_cache_aware_mass_p();
++        const uint32_t cache_aware_min = ds4_glm_cache_aware_min_m();
++        if (cache_aware_mass_p > 0.0f && weights_prescale != NULL) {
++            const uint32_t resident_mask_local =
++                (~p->missing_mask) & ((n_selected >= 32) ? 0xffffffffu
++                                                          : ((1u << n_selected) - 1u));
++            uint32_t mass_dropped = ds4_glm_cache_aware_mass_select(
++                    cache_aware_mass_p,
++                    n_selected,
++                    resident_mask_local,
++                    p->missing_mask,
++                    weights_prescale);
++            // Only root slots are in load_slots. A dropped duplicate stays in
++            // dropped_mask anyway, because the consumer intersects it with its
++            // own fresh missing mask.
++            p->dropped_mask |= mass_dropped;
++        } else if (cache_aware_min != 0 && cache_aware_min < n_selected) {
++            for (uint32_t i = 0; i < n_selected; i++) {
++                if ((p->missing_mask & (1u << i)) == 0) continue;
++                const uint32_t root = p->source_slots[i];
++                if (root < n_selected && root >= cache_aware_min) {
++                    p->dropped_mask |= (1u << i);
++                }
++            }
++        }
++        if (p->dropped_mask != 0) {
++            uint32_t new_n_loads = 0;
++            for (uint32_t li = 0; li < p->n_loads; li++) {
++                const uint32_t slot = p->load_slots[li];
++                if ((p->dropped_mask & (1u << slot)) != 0) continue;
++                p->load_slots[new_n_loads++] = slot;
++            }
++            p->n_loads = new_n_loads;
++            // Dropped slots must also leave missing_mask: the pending-load
++            // install walk expects every missing bit to resolve to a loaded
++            // entry. ds4_gpu_routed_moe_one_tensor tracks the drop set
++            // separately (prefetch_dropped_mask) and does its own alias and
++            // weight handling.
++            p->missing_mask &= ~p->dropped_mask;
++        }
++    }
+     if (p->n_loads == 0) return 1;
+ 
+     const uint32_t cache_budget =
+@@ -17221,7 +17517,8 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
+ static void ds4_gpu_glm_stream_selected_prefetch_set(
+         const ds4_gpu_stream_expert_table *table,
+         const int32_t                     *selected_ids,
+-        uint32_t                           n_selected) {
++        uint32_t                           n_selected,
++        uint32_t                           dropped_mask) {
+     g_glm_stream_selected_prefetch.active = 0;
+     if (!table || !selected_ids ||
+         n_selected == 0 ||
+@@ -17241,6 +17538,7 @@ static void ds4_gpu_glm_stream_selected_prefetch_set(
+     for (uint32_t i = 0; i < n_selected; i++) {
+         g_glm_stream_selected_prefetch.selected_ids[i] = selected_ids[i];
+     }
++    g_glm_stream_selected_prefetch.dropped_mask = dropped_mask;
+     g_glm_stream_selected_prefetch.active = 1;
+ }
+ 
+@@ -17255,7 +17553,8 @@ static int ds4_gpu_glm_stream_selected_prefetch_take(
+         uint64_t    down_offset,
+         uint64_t    gate_expert_bytes,
+         uint64_t    down_expert_bytes,
+-        int32_t    *selected_ids_out) {
++        int32_t    *selected_ids_out,
++        uint32_t   *dropped_mask_out) {
+     if (!selected_ids_out || !g_glm_stream_selected_prefetch.active) return 0;
+     ds4_gpu_glm_stream_selected_prefetch *p = &g_glm_stream_selected_prefetch;
+     if (p->model_map != model_map ||
+@@ -17273,6 +17572,7 @@ static int ds4_gpu_glm_stream_selected_prefetch_take(
+     for (uint32_t i = 0; i < n_selected; i++) {
+         selected_ids_out[i] = p->selected_ids[i];
+     }
++    if (dropped_mask_out) *dropped_mask_out = p->dropped_mask;
+     p->active = 0;
+     return 1;
+ }
+@@ -17280,7 +17580,10 @@ static int ds4_gpu_glm_stream_selected_prefetch_take(
+ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+         const ds4_gpu_stream_expert_table *table,
+         const ds4_gpu_tensor              *selected,
+-        uint32_t                           n_selected) {
++        uint32_t                           n_selected,
++        // The router's weights tensor, parallel to `selected`. Read only
++        // when DS4_GLM_CACHE_AWARE_MASS is set; NULL disables MASS here.
++        const ds4_gpu_tensor              *weights) {
+     g_glm_stream_selected_prefetch.active = 0;
+     if (!g_ssd_streaming_mode ||
+         getenv("DS4_METAL_DISABLE_GLM_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
+@@ -17314,6 +17617,21 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                                  0,
+                                  selected_ids,
+                                  (uint64_t)n_selected * sizeof(selected_ids[0])) != 0;
++    const float mass_p_active = ds4_glm_cache_aware_mass_p();
++    float mass_weights[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
++    const float *mass_weights_ptr = NULL;
++    if (ok && mass_p_active > 0.0f && weights != NULL) {
++        float raw_weights[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
++        if (ds4_gpu_tensor_read(weights,
++                                0,
++                                raw_weights,
++                                (uint64_t)n_selected * sizeof(raw_weights[0])) != 0) {
++            for (uint32_t i = 0; i < n_selected; i++) {
++                mass_weights[i] = raw_weights[i] / DS4_GLM_EXPERT_WEIGHT_SCALE;
++            }
++            mass_weights_ptr = mass_weights;
++        }
++    }
+     if (timing) {
+         selected_copy_ms = ds4_gpu_now_ms() - t0;
+         t0 = ds4_gpu_now_ms();
+@@ -17321,7 +17639,8 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+     if (ok) {
+         ok = ds4_gpu_stream_expert_cache_begin_selected_load(table,
+                                                              selected_ids,
+-                                                             n_selected) != 0;
++                                                             n_selected,
++                                                             mass_weights_ptr) != 0;
+     }
+     if (timing) {
+         selected_bind_ms = ds4_gpu_now_ms() - t0;
+@@ -17332,7 +17651,8 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+     if (ok) {
+         ds4_gpu_glm_stream_selected_prefetch_set(table,
+                                                  selected_ids,
+-                                                 n_selected);
++                                                 n_selected,
++                                                 g_stream_expert_pending_load.dropped_mask);
+     }
+     if (had_batch && ds4_gpu_begin_commands() == 0) ok = 0;
+     return ok;
+@@ -37961,6 +38281,12 @@ int ds4_gpu_glm_router_select_tensor(
+         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM router select")) return 0;
+     }
+ 
++    // Record the probs tensor for the DS4_GLM_SUBST=router path in
++    // ds4_gpu_routed_moe_one_tensor, only when that feature is on.
++    if (ds4_glm_subst_mode() != DS4_GLM_SUBST_OFF) {
++        ds4_glm_subst_note_router_probs(probs, n_expert);
++    }
++
+     return 1;
+ }
+ 
+@@ -38236,7 +38562,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
+                                                           down_offset,
+                                                           gate_expert_bytes,
+                                                           down_expert_bytes,
+-                                                          stream_selected_ids);
++                                                          stream_selected_ids,
++                                                          NULL /* cache-aware drop is wired only into
++                                                                  ds4_gpu_routed_moe_one_tensor */);
+             if (have_prefetched_selected) {
+                 if (had_batch && g_batch_has_work &&
+                     g_stream_expert_pending_load.active &&
+@@ -38348,7 +38676,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
+                     if (!ds4_gpu_stream_expert_cache_begin_selected_load(
+                                 &table,
+                                 stream_selected_ids,
+-                                n_expert)) {
++                                n_expert,
++                                NULL /* split-deferred preload: no cache-aware drop here */)) {
+                         stream_ok = 0;
+                     }
+                 }
+@@ -41397,6 +41726,10 @@ int ds4_gpu_routed_moe_one_tensor(
+             const char *selected_id_source = "readback";
+             bool selected_ids_available = true;
+             bool selected_exec_ids_from_host = false;
++            // Slots the early-load path already dropped (see
++            // ds4_gpu_stream_expert_pending_load.dropped_mask); valid only
++            // when selected_id_source ends up "prefetched".
++            uint32_t prefetch_dropped_mask = 0;
+             const int stream_expert_cache_size_known =
+                 ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
+                                                              down_expert_bytes);
+@@ -41496,7 +41829,7 @@ int ds4_gpu_routed_moe_one_tensor(
+                                n_total_expert, n_expert,
+                                gate_offset, up_offset, down_offset,
+                                gate_expert_bytes, down_expert_bytes,
+-                               selected_ids)) {
++                               selected_ids, &prefetch_dropped_mask)) {
+                     /* GLM already read these IDs to start loading experts.
+                      * Submit the shared expert work while the reads finish. */
+                     selected_id_source = "prefetched";
+@@ -41764,11 +42097,100 @@ int ds4_gpu_routed_moe_one_tensor(
+                     if (!ds4_gpu_stream_expert_cache_begin_selected_load(
+                                 &table,
+                                 selected_ids,
+-                                n_expert)) {
++                                n_expert,
++                                NULL /* split-deferred preload: cache-aware drop is decided
++                                        below, not in begin_selected_load */)) {
+                         if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33156);
+                         return 0;
+                     }
+                 }
++                // Cache-aware drop: decide which missing slots to drop before
++                // the cache/SSD load below, so their bytes are never read. The
++                // decision is made here, fresh, for both the "readback" and the
++                // "prefetched" selected-id sources, from the residency peeked
++                // above (stream_expert_resident_mask / stream_expert_missing_mask)
++                // and the router weights. For "prefetched", the early-load path
++                // already skipped some reads using an earlier residency snapshot;
++                // a slot kept here that early-load skipped gets a synchronous
++                // load below, so correctness is unaffected.
++                //
++                // DS4_GLM_CACHE_AWARE_MASS, when set, decides alone. Otherwise
++                // DS4_GLM_CACHE_AWARE_MIN drops missing slots ranked >= m, and
++                // DS4_GLM_CACHE_AWARE_TAU keeps a candidate whose stored weight is
++                // >= tau * DS4_GLM_EXPERT_WEIGHT_SCALE.
++                const float cache_aware_mass_p = ds4_glm_cache_aware_mass_p();
++                const uint32_t cache_aware_min = ds4_glm_cache_aware_min_m();
++                const float cache_aware_tau = ds4_glm_cache_aware_tau();
++                uint32_t cache_aware_candidates = 0;
++                const BOOL cache_aware_rank_ok =
++                    cache_aware_min != 0 && cache_aware_min < n_expert;
++                const BOOL cache_aware_base_eligible =
++                    use_stream_expert_cache &&
++                    selected_ids_available &&
++                    !use_stream_expert_split_deferred &&
++                    selected_id_source != NULL &&
++                    (cache_aware_mass_p > 0.0f || cache_aware_rank_ok);
++                uint32_t cache_aware_dropped_mask = 0;
++                const BOOL cache_aware_is_prefetched =
++                    selected_id_source != NULL &&
++                    strcmp(selected_id_source, "prefetched") == 0;
++                const BOOL cache_aware_source_ok =
++                    cache_aware_base_eligible &&
++                    selected_id_source != NULL &&
++                    (strcmp(selected_id_source, "readback") == 0 ||
++                     cache_aware_is_prefetched);
++                if (cache_aware_source_ok) {
++                    if (cache_aware_mass_p > 0.0f) {
++                        uint8_t *mass_weights_base = (uint8_t *)[weightsbuf contents];
++                        if (mass_weights_base) {
++                            float mass_w[8];
++                            for (uint32_t ci = 0; ci < n_expert && ci < 8u; ci++) {
++                                const float *wp = (const float *)(mass_weights_base +
++                                    ds4_gpu_tensor_offset(weights) +
++                                    (uint64_t)ci * sizeof(float));
++                                mass_w[ci] = *wp / DS4_GLM_EXPERT_WEIGHT_SCALE;
++                            }
++                            cache_aware_dropped_mask = ds4_glm_cache_aware_mass_select(
++                                    cache_aware_mass_p,
++                                    n_expert,
++                                    stream_expert_resident_mask,
++                                    stream_expert_missing_mask,
++                                    mass_w);
++                            cache_aware_candidates = cache_aware_dropped_mask;
++                        } else if (cache_aware_is_prefetched) {
++                            // Weights buffer unexpectedly unreadable: fall
++                            // back to the early-load decision.
++                            cache_aware_candidates =
++                                prefetch_dropped_mask & stream_expert_missing_mask;
++                            cache_aware_dropped_mask = cache_aware_candidates;
++                        }
++                    } else {
++                        for (uint32_t ci = cache_aware_min; ci < n_expert; ci++) {
++                            if ((stream_expert_missing_mask & (1u << ci)) != 0) {
++                                cache_aware_candidates |= (1u << ci);
++                            }
++                        }
++                        cache_aware_dropped_mask = cache_aware_candidates;
++                    }
++                }
++                if (cache_aware_mass_p <= 0.0f &&
++                    cache_aware_candidates != 0 && cache_aware_tau > 0.0f) {
++                    uint8_t *tau_weights_base = (uint8_t *)[weightsbuf contents];
++                    if (tau_weights_base) {
++                        const float tau_threshold =
++                            cache_aware_tau * DS4_GLM_EXPERT_WEIGHT_SCALE;
++                        for (uint32_t ci = 0; ci < n_expert; ci++) {
++                            if ((cache_aware_candidates & (1u << ci)) == 0) continue;
++                            const float *wp = (const float *)(tau_weights_base +
++                                ds4_gpu_tensor_offset(weights) +
++                                (uint64_t)ci * sizeof(float));
++                            if (*wp >= tau_threshold) {
++                                cache_aware_dropped_mask &= ~(1u << ci);
++                            }
++                        }
++                    }
++                }
++                stream_expert_missing_mask &= ~cache_aware_dropped_mask;
+                 if (stream_expert_missing_mask != 0 &&
+                     !use_stream_expert_split_deferred) {
+                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(
+@@ -41800,6 +42222,178 @@ int ds4_gpu_routed_moe_one_tensor(
+                         down_slot_offsets[i] = entry->down_inner;
+                     }
+                 }
++                if (cache_aware_dropped_mask != 0) {
++                    const ds4_glm_subst_mode_t glm_subst_mode_v = ds4_glm_subst_mode();
++                    if (glm_subst_mode_v == DS4_GLM_SUBST_OFF) {
++                    ds4_gpu_stream_expert_cache_entry *alias_entry = stream_slot_entries[0];
++                    id<MTLBuffer> alias_gate_buf = gate_slot_bufs[0];
++                    NSUInteger alias_gate_off = gate_slot_offsets[0];
++                    id<MTLBuffer> alias_up_buf = up_slot_bufs[0];
++                    NSUInteger alias_up_off = up_slot_offsets[0];
++                    id<MTLBuffer> alias_down_buf = down_slot_bufs[0];
++                    NSUInteger alias_down_off = down_slot_offsets[0];
++                    if (!alias_entry || !alias_gate_buf || !alias_up_buf || !alias_down_buf) {
++                        if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: slot 0 not ready\n");
++                        return 0;
++                    }
++                    uint8_t *weights_base = (uint8_t *)[weightsbuf contents];
++                    uint8_t *selected_base = (uint8_t *)[selectedbuf contents];
++                    if (!weights_base || !selected_base) {
++                        if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: shared buffer contents unavailable\n");
++                        return 0;
++                    }
++                    const int32_t alias_id = selected_ids[0];
++                    for (uint32_t ci = 0; ci < n_expert; ci++) {
++                        if ((cache_aware_dropped_mask & (1u << ci)) == 0) continue;
++                        stream_slot_entries[ci] = alias_entry;
++                        alias_entry->use_count++;
++                        selected_ids[ci] = alias_id;
++                        stream_gate_abs_offsets[ci] = stream_gate_abs_offsets[0];
++                        stream_up_abs_offsets[ci] = stream_up_abs_offsets[0];
++                        stream_down_abs_offsets[ci] = stream_down_abs_offsets[0];
++                        gate_slot_bufs[ci] = alias_gate_buf;
++                        gate_slot_offsets[ci] = alias_gate_off;
++                        up_slot_bufs[ci] = alias_up_buf;
++                        up_slot_offsets[ci] = alias_up_off;
++                        down_slot_bufs[ci] = alias_down_buf;
++                        down_slot_offsets[ci] = alias_down_off;
++                        // Zero this slot's weight and mirror the alias id
++                        // into the selected-ids buffer. Both are shared
++                        // (CPU-writable) buffers; the router's GPU work is
++                        // already complete and the MoE kernel reading them
++                        // has not been encoded yet.
++                        float *weight_ptr = (float *)(weights_base +
++                            ds4_gpu_tensor_offset(weights) +
++                            (uint64_t)ci * sizeof(float));
++                        *weight_ptr = 0.0f;
++                        int32_t *selected_ptr = (int32_t *)(selected_base +
++                            ds4_gpu_tensor_offset(selected) +
++                            (uint64_t)ci * sizeof(int32_t));
++                        *selected_ptr = alias_id;
++                    }
++                    } else {
++                        // DS4_GLM_SUBST=router: same slot-0 alias setup as the
++                        // branch above (used as the per-slot fallback), plus a
++                        // search for a cached, unclaimed substitute per dropped
++                        // slot.
++                        ds4_gpu_stream_expert_cache_entry *alias_entry = stream_slot_entries[0];
++                        id<MTLBuffer> alias_gate_buf = gate_slot_bufs[0];
++                        NSUInteger alias_gate_off = gate_slot_offsets[0];
++                        id<MTLBuffer> alias_up_buf = up_slot_bufs[0];
++                        NSUInteger alias_up_off = up_slot_offsets[0];
++                        id<MTLBuffer> alias_down_buf = down_slot_bufs[0];
++                        NSUInteger alias_down_off = down_slot_offsets[0];
++                        if (!alias_entry || !alias_gate_buf || !alias_up_buf || !alias_down_buf) {
++                            if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: slot 0 not ready\n");
++                            return 0;
++                        }
++                        uint8_t *weights_base = (uint8_t *)[weightsbuf contents];
++                        uint8_t *selected_base = (uint8_t *)[selectedbuf contents];
++                        if (!weights_base || !selected_base) {
++                            if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: shared buffer contents unavailable\n");
++                            return 0;
++                        }
++                        const int32_t alias_id = selected_ids[0];
++
++                        // Substitution engages only on a single, unsplit expert
++                        // range; otherwise every dropped slot takes the fallback.
++                        const BOOL subst_single_gpu_ok =
++                            (first_expert == 0 && n_bind_expert == n_total_expert);
++                        const float *subst_probs =
++                            (glm_subst_mode_v == DS4_GLM_SUBST_ROUTER && subst_single_gpu_ok) ?
++                                ds4_glm_subst_router_probs_ptr(n_total_expert) : NULL;
++
++                        int32_t claimed_ids[DS4_METAL_MAX_ROUTED_EXPERT_USED * 2];
++                        uint32_t n_claimed = 0;
++                        for (uint32_t i = 0; i < n_expert; i++) {
++                            claimed_ids[n_claimed++] = selected_ids[i];
++                        }
++
++                        for (uint32_t ci = 0; ci < n_expert; ci++) {
++                            if ((cache_aware_dropped_mask & (1u << ci)) == 0) continue;
++                            int32_t best_id = -1;
++                            float best_prob = -1.0f;
++                            ds4_gpu_stream_expert_cache_entry *best_entry = NULL;
++                            uint64_t best_gate_abs = 0, best_up_abs = 0, best_down_abs = 0;
++                            if (subst_probs) {
++                                for (uint32_t cand = 0; cand < n_total_expert; cand++) {
++                                    BOOL claimed = NO;
++                                    for (uint32_t k = 0; k < n_claimed; k++) {
++                                        if (claimed_ids[k] == (int32_t)cand) { claimed = YES; break; }
++                                    }
++                                    if (claimed) continue;
++                                    const float p = subst_probs[cand];
++                                    if (p <= best_prob) continue;
++                                    const uint64_t cand_gate_rel = (uint64_t)cand * gate_expert_bytes;
++                                    const uint64_t cand_down_rel = (uint64_t)cand * down_expert_bytes;
++                                    const uint64_t cand_gate_abs = gate_offset + cand_gate_rel;
++                                    const uint64_t cand_up_abs = up_offset + cand_gate_rel;
++                                    const uint64_t cand_down_abs = down_offset + cand_down_rel;
++                                    ds4_gpu_stream_expert_cache_entry *entry =
++                                        ds4_gpu_stream_expert_cache_peek(model_map,
++                                                                         model_size,
++                                                                         layer_index,
++                                                                         cand,
++                                                                         n_total_expert,
++                                                                         n_expert,
++                                                                         cand_gate_abs,
++                                                                         cand_up_abs,
++                                                                         cand_down_abs,
++                                                                         gate_expert_bytes,
++                                                                         down_expert_bytes);
++                                    if (!entry) continue;
++                                    best_id = (int32_t)cand;
++                                    best_prob = p;
++                                    best_entry = entry;
++                                    best_gate_abs = cand_gate_abs;
++                                    best_up_abs = cand_up_abs;
++                                    best_down_abs = cand_down_abs;
++                                }
++                            }
++                            float *weight_ptr = (float *)(weights_base +
++                                ds4_gpu_tensor_offset(weights) +
++                                (uint64_t)ci * sizeof(float));
++                            int32_t *selected_ptr = (int32_t *)(selected_base +
++                                ds4_gpu_tensor_offset(selected) +
++                                (uint64_t)ci * sizeof(int32_t));
++                            if (best_id >= 0 && best_entry) {
++                                claimed_ids[n_claimed++] = best_id;
++                                stream_slot_entries[ci] = best_entry;
++                                best_entry->use_count++;
++                                selected_ids[ci] = best_id;
++                                stream_gate_abs_offsets[ci] = best_gate_abs;
++                                stream_up_abs_offsets[ci] = best_up_abs;
++                                stream_down_abs_offsets[ci] = best_down_abs;
++                                gate_slot_bufs[ci] = best_entry->gate_buffer;
++                                gate_slot_offsets[ci] = best_entry->gate_inner;
++                                up_slot_bufs[ci] = best_entry->up_buffer;
++                                up_slot_offsets[ci] = best_entry->up_inner;
++                                down_slot_bufs[ci] = best_entry->down_buffer;
++                                down_slot_offsets[ci] = best_entry->down_inner;
++                                *selected_ptr = best_id;
++                                // The dropped slot's own normalized weight is
++                                // left in place for the substitute.
++                            } else {
++                                // No cached, unclaimed candidate: alias to slot 0
++                                // with weight 0, as in the branch above.
++                                stream_slot_entries[ci] = alias_entry;
++                                alias_entry->use_count++;
++                                selected_ids[ci] = alias_id;
++                                stream_gate_abs_offsets[ci] = stream_gate_abs_offsets[0];
++                                stream_up_abs_offsets[ci] = stream_up_abs_offsets[0];
++                                stream_down_abs_offsets[ci] = stream_down_abs_offsets[0];
++                                gate_slot_bufs[ci] = alias_gate_buf;
++                                gate_slot_offsets[ci] = alias_gate_off;
++                                up_slot_bufs[ci] = alias_up_buf;
++                                up_slot_offsets[ci] = alias_up_off;
++                                down_slot_bufs[ci] = alias_down_buf;
++                                down_slot_offsets[ci] = alias_down_off;
++                                *weight_ptr = 0.0f;
++                                *selected_ptr = alias_id;
++                            }
++                        }
++                    }
++                }
+                 if (use_iq2_stream_addr_table && use_stream_expert_addr_table) {
+                     for (uint32_t i = 0; i < n_expert; i++) {
+                         ds4_gpu_stream_expert_cache_entry *entry = stream_slot_entries[i];
+diff --git a/ds4_server.c b/ds4_server.c
+index 20fba30..4b169ae 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -13924,6 +13924,10 @@ decode_again:
+     dsml_decode_tracker_init(&dsml_tracker);
+     dsml_tracker.model_syntax = j->req.model_syntax;
+ 
++    // Start of this request's generation for DS4_GLM_APPROX_WARMUP_TOKENS (see
++    // ds4_metal.m). The token sampled on the first loop iteration still comes
++    // from prefill's logits.
++    ds4_glm_approx_warmup_reset();
+     server_generation_enter(s);
+     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
+            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+@@ -14014,6 +14018,10 @@ decode_again:
+             ntok = 1;
+         }
+ 
++        // This iteration's decode eval just ran (whichever branch above took
++        // it); advance the warm-up step counter.
++        ds4_glm_approx_warmup_note_step();
++
+         if (ntok == 0) {
+             finish = "error";
+             snprintf(err, sizeof(err), "decode returned no tokens");
+@@ -14257,6 +14265,15 @@ decode_again:
+     }
+     server_generation_leave(s);
+ 
++    {
++        const uint64_t warmup_forced = ds4_glm_approx_warmup_forced_this_gen();
++        if (warmup_forced > 0) {
++            server_log(DS4_LOG_DEFAULT,
++                       "ds4-server: GLM approx-warmup: forced exact for %llu decode step(s) this request (completion=%d)",
++                       (unsigned long long)warmup_forced, completion);
++        }
++    }
++
+     if (job_cancelled(j)) {
+         request_live_state_clear(s, slot);
+         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
