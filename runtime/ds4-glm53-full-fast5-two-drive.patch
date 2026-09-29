@@ -1,0 +1,2567 @@
+diff --git a/Makefile b/Makefile
+index 76d115f..488fb57 100644
+--- a/Makefile
++++ b/Makefile
+@@ -26,7 +26,7 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+ 
+ ifeq ($(UNAME_S),Darwin)
+ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
++CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_stripe.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
+ CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+ else
+ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
+@@ -498,6 +498,9 @@ ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/pn
+ ds4_ssd.o: ds4_ssd.c ds4_ssd.h
+ 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
+ 
++ds4_stripe.o: ds4_stripe.c ds4_stripe.h
++	$(CC) $(CFLAGS) -c -o $@ ds4_stripe.c
++
+ ds4_engram.o: ds4_engram.c ds4_engram.h
+ 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -c -o $@ ds4_engram.c
+ 
+@@ -576,7 +579,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4_eval_cases.h ds4.h ds4_ssd.h ds4_distributed.h ds
+ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
+ 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
+ 
+-ds4_metal.o: ds4_metal.m ds4.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h $(METAL_SRCS)
++ds4_metal.o: ds4_metal.m ds4.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h ds4_stripe.h $(METAL_SRCS)
+ 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
+ 
+ tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
+diff --git a/ds4.c b/ds4.c
+index af13cc8..ac08b6f 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -23125,7 +23125,8 @@ static bool metal_graph_decode_set_hash_selected_override(
+         if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                     &table,
+                     selected_i32,
+-                    DS4_N_EXPERT_USED) == 0) {
++                    DS4_N_EXPERT_USED,
++                    NULL /* early-load path without router weights: MASS not applied here */) == 0) {
+             return false;
+         }
+     }
+@@ -23305,7 +23306,8 @@ static bool metal_graph_decode_selected_readahead_override(
+     if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                 &table,
+                 selected_ids,
+-                DS4_N_EXPERT_USED) == 0) {
++                DS4_N_EXPERT_USED,
++                NULL /* early-load path without router weights: MASS not applied here */) == 0) {
+         return false;
+     }
+     if (ds4_gpu_begin_commands() == 0) return false;
+@@ -23566,7 +23568,8 @@ static void metal_graph_selected_async_load_run(
+     if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                 &table,
+                 job->selected_ids,
+-                DS4_N_EXPERT_USED) == 0) {
++                DS4_N_EXPERT_USED,
++                NULL /* early-load path without router weights: MASS not applied here */) == 0) {
+         return;
+     }
+ 
+@@ -26956,7 +26959,8 @@ static bool metal_graph_encode_decode_layer_phase(
+                     ds4_gpu_stream_expert_cache_begin_selected_load(
+                             &retry_table,
+                             async_load.selected_ids,
+-                            DS4_N_EXPERT_USED) != 0 &&
++                            DS4_N_EXPERT_USED,
++                            NULL /* early-load path without router weights: MASS not applied here */) != 0 &&
+                     ds4_gpu_routed_moe_set_selected_override(
+                             async_load.selected_ids,
+                             DS4_N_EXPERT_USED) != 0;
+@@ -26984,7 +26988,8 @@ static bool metal_graph_encode_decode_layer_phase(
+                 ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                             &table,
+                             selected_ids,
+-                            DS4_N_EXPERT_USED) != 0;
++                            DS4_N_EXPERT_USED,
++                            NULL /* early-load path without router weights: MASS not applied here */) != 0;
+             }
+         }
+         if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+@@ -49046,7 +49051,8 @@ static bool glm_graph_encode_sparse_ffn_one(
+                 ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                         &table,
+                         g->router_selected,
+-                        DS4_N_EXPERT_USED) != 0;
++                        DS4_N_EXPERT_USED,
++                        g->router_weights) != 0;
+             }
+             if (async_profile) {
+                 g_glm_streaming_async_profile.sync_early_load_ms +=
+@@ -51619,7 +51625,8 @@ static bool glm_graph_mtp_step(
+                 .down_expert_bytes = down_out * down_row_bytes,
+             };
+             ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+-                    &table, g->router_selected, DS4_N_EXPERT_USED) != 0;
++                    &table, g->router_selected, DS4_N_EXPERT_USED,
++                    g->router_weights) != 0;
+         }
+ #endif
+         const bool tp_split = g->tp_world == 2 && g->tp_out && g->tp_in;
+@@ -56994,7 +57001,8 @@ static int glm_metal_first_token_logits(
+                 ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                         &table,
+                         router_selected,
+-                        DS4_N_EXPERT_USED) != 0;
++                        DS4_N_EXPERT_USED,
++                        router_weights) != 0;
+             }
+             ds4_glm_gpu_graph route_g = {
+                 .routed_gate = routed_gate,
+@@ -57287,6 +57295,8 @@ static int generate_glm_metal_argmax(
+     int n_decode_eval = 0;
+     uint32_t pos = (uint32_t)prompt->len;
+     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
++    // Start of a generation for DS4_GLM_APPROX_WARMUP_TOKENS (see ds4_metal.m).
++    ds4_glm_approx_warmup_reset();
+     const double t_decode0 = now_sec();
+     for (int i = 0; i < n_predict && pos < g.ctx_size; i++) {
+         if (getenv("DS4_TRACE_TOP") != NULL) {
+@@ -57313,6 +57323,8 @@ static int generate_glm_metal_argmax(
+             glm_graph_free(&g);
+             return 1;
+         }
++        // One decode eval just ran; advance the warm-up step counter.
++        ds4_glm_approx_warmup_note_step();
+         if (token_timing) {
+             const double t_eval1 = now_sec();
+             fprintf(stderr,
+@@ -57334,6 +57346,14 @@ static int generate_glm_metal_argmax(
+             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+ 
++    {
++        const uint64_t warmup_forced = ds4_glm_approx_warmup_forced_this_gen();
++        if (warmup_forced > 0) {
++            fprintf(stderr,
++                    "ds4: GLM approx-warmup: forced exact for %llu/%d decode step(s) this generation\n",
++                    (unsigned long long)warmup_forced, n_decode_eval);
++        }
++    }
+     if (memory_report) ds4_gpu_print_memory_report("before GLM graph free");
+     free(logits);
+     glm_graph_free(&g);
+@@ -66401,7 +66421,8 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+             ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                     &table,
+                     router_selected,
+-                    DS4_N_EXPERT_USED) != 0;
++                    DS4_N_EXPERT_USED,
++                    router_weights) != 0;
+             if (ok) {
+                 layer_glm_routed_moe_one_f32_ref(cpu_sparse_moe,
+                                                  cpu_sparse_mid,
+@@ -66706,7 +66727,8 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+                 ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                         &table,
+                         router_selected,
+-                        DS4_N_EXPERT_USED) != 0;
++                        DS4_N_EXPERT_USED,
++                        router_weights) != 0;
+             }
+             ds4_glm_gpu_graph route_g = {
+                 .routed_gate = routed_gate,
+diff --git a/ds4.h b/ds4.h
+index 49a172d..a8c87ae 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -528,6 +528,16 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
+ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
+ int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
+ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
++/* DS4_GLM_APPROX_WARMUP_TOKENS=N (default 0 = off), implemented in
++ * ds4_metal.m: the approximate expert routing (DS4_GLM_CACHE_AWARE_MIN/
++ * _TAU/_MASS and DS4_GLM_SUBST) is turned off for the first N decode steps
++ * of a generation. Call ds4_glm_approx_warmup_reset() once before the first
++ * decode eval of a generation and ds4_glm_approx_warmup_note_step() once
++ * after each decode eval. ds4_glm_approx_warmup_forced_this_gen() returns how
++ * many decode steps since the last reset ran forced-exact. */
++void ds4_glm_approx_warmup_reset(void);
++void ds4_glm_approx_warmup_note_step(void);
++uint64_t ds4_glm_approx_warmup_forced_this_gen(void);
+ /* Pay the one-time first-submission GPU cost outside any measured window;
+  * used by the TP worker right after session create (no-op on CPU/GLM). */
+ void ds4_session_gpu_warmup(ds4_session *s);
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index a4c76a5..99f65a9 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -381,11 +381,13 @@ int ds4_gpu_stream_expert_cache_seed_selected(
+ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         const ds4_gpu_stream_expert_table *table,
+         const int32_t                     *selected_ids,
+-        uint32_t                           n_selected);
++        uint32_t                           n_selected,
++        const float                       *weights_prescale);
+ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+         const ds4_gpu_stream_expert_table *table,
+         const ds4_gpu_tensor              *selected,
+-        uint32_t                           n_selected);
++        uint32_t                           n_selected,
++        const ds4_gpu_tensor              *weights);
+ #ifdef __APPLE__
+ /* The async selected-load worker registers itself so Metal cache paths never
+  * wait on command buffers from that thread (they fail the load instead and
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 16ae514..0e4fe96 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -25,6 +25,7 @@
+ #include "ds4.h"
+ #include "ds4_gpu.h"
+ #include "ds4_image.h"
++#include "ds4_stripe.h"
+ 
+ /*
+  * Objective-C Metal glue for the C engine.
+@@ -6487,6 +6488,234 @@ static int ds4_gpu_encode_rope_tail_inplace(
+     uint32_t pad0;
+ } ds4_gpu_glm_router_select_one_args;
+ 
++// GLM-5.3 approximate expert routing (experimental). Every switch below is
++// off by default; with all of them unset, decoding is unchanged. Values are
++// read from the environment once and cached.
++static uint32_t ds4_glm_fast_routing_env_u32(const char *name) {
++    const char *env = getenv(name);
++    if (!env || !env[0]) return 0;
++    char *end = NULL;
++    long v = strtol(env, &end, 10);
++    if (end == env || *end != '\0' || v <= 0 || v > 256) return 0;
++    return (uint32_t)v;
++}
++
++// DS4_GLM_APPROX_WARMUP_TOKENS=N (default 0 = off) turns the approximate
++// routing below (DS4_GLM_CACHE_AWARE_MIN/_TAU/_MASS and DS4_GLM_SUBST) off
++// for the first N decode steps of every generation, so those steps make the
++// same expert selection as exact decoding; the approximation resumes from
++// step N onward. The approximate modes decide what to drop or substitute
++// partly from the current expert-cache contents, and those depend on
++// earlier requests. In one reproduced case, a particular request history
++// made the approximation derail an answer from its second generated token;
++// making the first decode steps exact fixed that case. Next-layer prefetch
++// and other cache behavior are not affected by this switch.
++//
++// Steps are counted with one file-scope counter. That is correct as long as
++// only one generation decodes at a time in the process: the CLI decode loop,
++// and ds4-server in its default mode, where decoding is serialized by its
++// inference mutex. With --batched-sessions the server decodes several
++// sessions concurrently and they would share this counter, so the warm-up
++// window is not tracked correctly in that mode.
++//
++// ds4_glm_approx_warmup_reset() is called once at the start of a generation
++// and ds4_glm_approx_warmup_note_step() once after each decode eval, in
++// ds4.c generate_glm_metal_argmax() (CLI generation) and ds4_server.c
++// generate_job_inner() (one HTTP request). Other paths, including perplexity
++// scoring, are not wired; there the counter stays at 0, so with the variable
++// set every step is exact.
++static uint32_t ds4_glm_approx_warmup_tokens(void) {
++    static int checked = 0;
++    static uint32_t v = 0;
++    if (!checked) {
++        v = ds4_glm_fast_routing_env_u32("DS4_GLM_APPROX_WARMUP_TOKENS");
++        checked = 1;
++    }
++    return v;
++}
++
++static uint32_t g_glm_approx_warmup_step = 0;
++
++// True while the current decode step is inside the warm-up window (step < N).
++static int ds4_glm_approx_warmup_active(void) {
++    const uint32_t n = ds4_glm_approx_warmup_tokens();
++    return n != 0 && g_glm_approx_warmup_step < n;
++}
++
++// Call once at the start of every generation.
++void ds4_glm_approx_warmup_reset(void) {
++    g_glm_approx_warmup_step = 0;
++}
++
++// Call once after each decode eval (one generated token). It must run after
++// the eval, because the getters below read the counter during the eval.
++void ds4_glm_approx_warmup_note_step(void) {
++    g_glm_approx_warmup_step++;
++}
++
++// Number of decode steps since the last reset that ran forced-exact.
++uint64_t ds4_glm_approx_warmup_forced_this_gen(void) {
++    const uint32_t n = ds4_glm_approx_warmup_tokens();
++    return g_glm_approx_warmup_step < n ? g_glm_approx_warmup_step : n;
++}
++
++// DS4_GLM_CACHE_AWARE_MIN=m. Applies to the single-token decode MoE path
++// (ds4_gpu_routed_moe_one_tensor). Slots ranked < m always load. A slot
++// ranked >= m is used only if its expert is already in the streaming expert
++// cache; a cache miss there is dropped (no SSD read) and aliased to slot 0
++// with weight 0. 0 (unset) = off.
++static uint32_t ds4_glm_cache_aware_min_m(void) {
++    // Forced off during the warm-up window.
++    if (ds4_glm_approx_warmup_active()) return 0;
++    static int checked = 0;
++    static uint32_t v = 0;
++    if (!checked) {
++        v = ds4_glm_fast_routing_env_u32("DS4_GLM_CACHE_AWARE_MIN");
++        checked = 1;
++    }
++    return v;
++}
++
++// DS4_GLM_CACHE_AWARE_TAU=tau. A missing slot ranked >= m is loaded instead
++// of dropped if its normalized router weight (before the router's
++// expert_weight_scale multiply) is >= tau. The weights buffer holds the
++// scaled value, so the comparison is stored_weight >= tau *
++// DS4_GLM_EXPERT_WEIGHT_SCALE. 0 (unset) disables the rescue.
++#define DS4_GLM_EXPERT_WEIGHT_SCALE 2.5f
++static float ds4_glm_cache_aware_tau(void) {
++    // Forced off during the warm-up window.
++    if (ds4_glm_approx_warmup_active()) return 0.0f;
++    static int checked = 0;
++    static float v = 0.0f;
++    if (!checked) {
++        const char *env = getenv("DS4_GLM_CACHE_AWARE_TAU");
++        if (env && env[0]) {
++            char *end = NULL;
++            double parsed = strtod(env, &end);
++            if (end != env && *end == '\0' && parsed > 0.0 && parsed < 1.0) {
++                v = (float)parsed;
++            }
++        }
++        checked = 1;
++    }
++    return v;
++}
++
++// DS4_GLM_CACHE_AWARE_MASS=p (0 < p <= 1; unset = off): mass-coverage drop.
++// When set, it replaces DS4_GLM_CACHE_AWARE_MIN/_TAU entirely. See
++// ds4_glm_cache_aware_mass_select() for the rule.
++static float ds4_glm_cache_aware_mass_p(void) {
++    // Forced off during the warm-up window.
++    if (ds4_glm_approx_warmup_active()) return 0.0f;
++    static int checked = 0;
++    static float v = 0.0f;
++    if (!checked) {
++        const char *env = getenv("DS4_GLM_CACHE_AWARE_MASS");
++        if (env && env[0]) {
++            char *end = NULL;
++            double parsed = strtod(env, &end);
++            if (end != env && *end == '\0' && parsed > 0.0 && parsed <= 1.0) {
++                v = (float)parsed;
++            }
++        }
++        checked = 1;
++    }
++    return v;
++}
++
++// Mass-coverage slot selection, shared by the early-load path
++// (ds4_gpu_stream_expert_cache_begin_selected_load, residency from its own
++// cache lookup) and the consumption path (ds4_gpu_routed_moe_one_tensor,
++// freshly peeked residency). Resident slots always count toward the used
++// router-weight mass. Missing slots are kept in rank order while that mass
++// is below p, and dropped after; rank 0 is always kept. ids[] must be in
++// rank order. Returns the bitmask of slots to drop (weight 0 + alias).
++static uint32_t ds4_glm_cache_aware_mass_select(
++        float p,
++        uint32_t n_expert,
++        uint32_t resident_mask,
++        uint32_t missing_mask,
++        const float *weights_prescale) {
++    if (p <= 0.0f || p > 1.0f || n_expert == 0) return 0;
++    float mass_used = 0.0f;
++    for (uint32_t i = 0; i < n_expert; i++) {
++        if ((resident_mask & (1u << i)) != 0) {
++            mass_used += weights_prescale[i];
++        }
++    }
++    uint32_t dropped = 0;
++    for (uint32_t i = 0; i < n_expert; i++) {
++        if ((missing_mask & (1u << i)) == 0) continue; // resident, already counted
++        if (i == 0) {
++            // rank 0 (top-1) is always used.
++            mass_used += weights_prescale[0];
++            continue;
++        }
++        if (mass_used < p) {
++            mass_used += weights_prescale[i];
++        } else {
++            dropped |= (1u << i);
++        }
++    }
++    return dropped;
++}
++
++// DS4_GLM_SUBST=router. For each slot the cache-aware drop above decided to
++// drop, use instead the already-cached expert (no extra SSD read; the lookup
++// is ds4_gpu_stream_expert_cache_peek()) with the highest raw router
++// probability that is not already used by this token's other slots or
++// claimed by an earlier substitute. The dropped slot's own normalized weight
++// is kept for the substitute. If no candidate is cached, the slot falls back
++// to the alias-to-slot-0 / weight-0 behavior. Unset = off.
++typedef enum {
++    DS4_GLM_SUBST_OFF    = 0,
++    DS4_GLM_SUBST_ROUTER = 1,
++} ds4_glm_subst_mode_t;
++
++static ds4_glm_subst_mode_t ds4_glm_subst_mode(void) {
++    // Forced off during the warm-up window. SUBST only acts on slots the drop
++    // logic dropped, which is already off then; this keeps it explicit.
++    if (ds4_glm_approx_warmup_active()) return DS4_GLM_SUBST_OFF;
++    static int checked = 0;
++    static ds4_glm_subst_mode_t mode = DS4_GLM_SUBST_OFF;
++    if (!checked) {
++        checked = 1;
++        const char *env = getenv("DS4_GLM_SUBST");
++        if (env && env[0]) {
++            if (strcmp(env, "router") == 0) mode = DS4_GLM_SUBST_ROUTER;
++        }
++    }
++    return mode;
++}
++
++// Recorded by ds4_gpu_glm_router_select_tensor() (the single-token decode
++// router), only when DS4_GLM_SUBST is on, and read by
++// ds4_gpu_routed_moe_one_tensor for the same layer later in the same token's
++// single-threaded dispatch.
++static ds4_gpu_tensor *g_glm_subst_router_probs_tensor = NULL;
++static uint32_t         g_glm_subst_router_probs_n_expert = 0;
++
++static void ds4_glm_subst_note_router_probs(ds4_gpu_tensor *probs, uint32_t n_expert) {
++    g_glm_subst_router_probs_tensor = probs;
++    g_glm_subst_router_probs_n_expert = n_expert;
++}
++
++// CPU-visible pointer to the n_expert raw sigmoid probabilities from the most
++// recent decode router call, or NULL if unavailable. The probs buffer is
++// shared storage, and the router's command buffer has already completed when
++// the drop path reaches this point, so no extra synchronization is needed.
++static const float *ds4_glm_subst_router_probs_ptr(uint32_t want_n_expert) {
++    if (!g_glm_subst_router_probs_tensor ||
++        g_glm_subst_router_probs_n_expert < want_n_expert) {
++        return NULL;
++    }
++    id<MTLBuffer> pb = ds4_gpu_tensor_buffer(g_glm_subst_router_probs_tensor);
++    if (!pb) return NULL;
++    uint8_t *base = (uint8_t *)[pb contents];
++    if (!base) return NULL;
++    return (const float *)(base + ds4_gpu_tensor_offset(g_glm_subst_router_probs_tensor));
++}
++
+ typedef struct {
+     uint32_t n_tokens;
+     uint32_t kv_raw_dim;
+@@ -13218,6 +13447,23 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
+         return;
+     }
+ 
++    // round10 (2026-09-26, task D): under striping, [offset, offset+len)
++    // is split across 2 physical files (internal sidecar + external
++    // GGUF); a plain F_RDADVISE on g_model_fd (the original, unstriped
++    // GGUF's fd) for the WHOLE range tells the OS to prefetch bytes off
++    // the external drive that a striped read will never actually pull
++    // from that drive for the sidecar-covered half -- wasted external-SSD
++    // I/O, and the reason readahead measured 2-8% SLOWER with striping on
++    // (see run-glm53-full-fast.zsh's GLM53_STRIPE comment). Try the
++    // striped, per-part hint first; ds4_stripe_try_readahead() is a fast
++    // no-op (returns 0) whenever striping is off or this range is not a
++    // known striped slice (e.g. the small minority of tensors that bypass
++    // the expert cache entirely), in which case we fall through to the
++    // exact pre-existing whole-range behavior below.
++    if (ds4_stripe_try_readahead(offset, len)) {
++        return;
++    }
++
+ #if defined(F_RDADVISE)
+     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
+     const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
+@@ -13264,6 +13510,11 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
+     uint32_t n_total_expert;
+     uint32_t n_selected;
+     uint32_t missing_mask;
++    // Slots whose load the cache-aware drop skipped in
++    // ds4_gpu_stream_expert_cache_begin_selected_load(). Carried through
++    // ds4_gpu_glm_stream_selected_prefetch so ds4_gpu_routed_moe_one_tensor
++    // knows which slots to alias.
++    uint32_t dropped_mask;
+     uint32_t load_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+     uint32_t source_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+     uint32_t n_loads;
+@@ -13300,6 +13551,9 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
+     uint64_t gate_expert_bytes;
+     uint64_t down_expert_bytes;
+     int32_t selected_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
++    // Slots the early-load path dropped (see
++    // ds4_gpu_stream_expert_pending_load.dropped_mask).
++    uint32_t dropped_mask;
+ } ds4_gpu_glm_stream_selected_prefetch;
+ 
+ static ds4_gpu_glm_stream_selected_prefetch g_glm_stream_selected_prefetch;
+@@ -13361,9 +13615,39 @@ static int ds4_gpu_stream_expert_pread_into(
+         double   *ms_out) {
+     if (read_bytes) *read_bytes = 0;
+     if (ms_out) *ms_out = 0.0;
++    if (!dst || len == 0) {
++        return 0;
++    }
++
++    /* GLM-5.3 stripe: if DS4_STRIPE_MANIFEST names this exact expert-
++     * tensor slice, fan the read out across the striped drives instead
++     * of a single pread on g_model_fd. ds4_stripe_try_pread() returns 0
++     * (not handled) for anything it doesn't recognize -- prefill
++     * full-layer reads, mmap'd views, and any layer/tensor the manifest
++     * doesn't cover all fall straight through to the original,
++     * unmodified pread path below, unchanged from upstream DS4. */
++    if (ds4_stripe_ensure_loaded()) {
++        uint64_t stripe_read_bytes = 0;
++        double stripe_ms = 0.0;
++        int stripe_ok = 0;
++        if (ds4_stripe_try_pread(offset, len, dst,
++                                 &stripe_read_bytes,
++                                 &stripe_ms,
++                                 &stripe_ok)) {
++            if (read_bytes) *read_bytes = stripe_read_bytes;
++            if (ms_out) *ms_out = stripe_ms;
++            if (!stripe_ok) {
++                fprintf(stderr,
++                        "ds4: Metal streaming expert striped pread failed offset=%.2f GiB len=%.2f MiB (%s)\n",
++                        ds4_gpu_gib(offset),
++                        ds4_gpu_mib(len),
++                        ds4_stripe_last_error());
++            }
++            return stripe_ok;
++        }
++    }
++
+     if (g_model_fd < 0 ||
+-        !dst ||
+-        len == 0 ||
+         offset > (uint64_t)LLONG_MAX ||
+         len > (uint64_t)LLONG_MAX - offset) {
+         return 0;
+@@ -16477,9 +16761,15 @@ static int ds4_gpu_stream_expert_pending_load_matches(
+ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         const ds4_gpu_stream_expert_table *table,
+         const int32_t                     *selected_ids,
+-        uint32_t                           n_selected) {
++        uint32_t                           n_selected,
++        // Router weights before the expert_weight_scale multiply, in the
++        // same rank order as selected_ids, or NULL when the caller has none.
++        // Lets DS4_GLM_CACHE_AWARE_MASS skip a read before it is issued.
++        const float                       *weights_prescale) {
+     if (!g_ssd_streaming_mode ||
+         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
++        // No drop decision was made here; clear any stale mask.
++        g_stream_expert_pending_load.dropped_mask = 0;
+         return 1;
+     }
+     if (!table) return 0;
+@@ -16503,6 +16793,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         ds4_gpu_stream_expert_cache_effective_cap(layer,
+                                                   n_total_expert,
+                                                   n_selected) == 0) {
++        g_stream_expert_pending_load.dropped_mask = 0;
+         return 1;
+     }
+     if (!g_initialized && !ds4_gpu_init()) return 0;
+@@ -16527,6 +16818,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
+     p->n_total_expert = n_total_expert;
+     p->n_selected = n_selected;
+     p->missing_mask = 0;
++    p->dropped_mask = 0;
+     p->n_loads = 0;
+     p->n_tasks = 0;
+     p->gate_expert_bytes = gate_expert_bytes;
+@@ -16611,6 +16903,58 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
+         p->missing_mask |= 1u << i;
+         p->load_slots[p->n_loads++] = i;
+     }
++
++    // Cache-aware drop in the early-load path. With DS4_GLM_CACHE_AWARE_MASS
++    // set, the mass-coverage rule decides; residency here comes from this
++    // function's own cache lookup above (a slot not in missing_mask already
++    // matched a live cache entry). Otherwise, with DS4_GLM_CACHE_AWARE_MIN=m,
++    // a missing slot is dropped only if its resolved source slot
++    // (source_slots[i]) is ranked >= m, because a duplicate of a lower-ranked
++    // slot still gets its data from that slot's load. TAU is not applied here
++    // (no weights); ds4_gpu_routed_moe_one_tensor applies it later and falls
++    // back to a synchronous load for a rescued slot.
++    {
++        const float cache_aware_mass_p = ds4_glm_cache_aware_mass_p();
++        const uint32_t cache_aware_min = ds4_glm_cache_aware_min_m();
++        if (cache_aware_mass_p > 0.0f && weights_prescale != NULL) {
++            const uint32_t resident_mask_local =
++                (~p->missing_mask) & ((n_selected >= 32) ? 0xffffffffu
++                                                          : ((1u << n_selected) - 1u));
++            uint32_t mass_dropped = ds4_glm_cache_aware_mass_select(
++                    cache_aware_mass_p,
++                    n_selected,
++                    resident_mask_local,
++                    p->missing_mask,
++                    weights_prescale);
++            // Only root slots are in load_slots. A dropped duplicate stays in
++            // dropped_mask anyway, because the consumer intersects it with its
++            // own fresh missing mask.
++            p->dropped_mask |= mass_dropped;
++        } else if (cache_aware_min != 0 && cache_aware_min < n_selected) {
++            for (uint32_t i = 0; i < n_selected; i++) {
++                if ((p->missing_mask & (1u << i)) == 0) continue;
++                const uint32_t root = p->source_slots[i];
++                if (root < n_selected && root >= cache_aware_min) {
++                    p->dropped_mask |= (1u << i);
++                }
++            }
++        }
++        if (p->dropped_mask != 0) {
++            uint32_t new_n_loads = 0;
++            for (uint32_t li = 0; li < p->n_loads; li++) {
++                const uint32_t slot = p->load_slots[li];
++                if ((p->dropped_mask & (1u << slot)) != 0) continue;
++                p->load_slots[new_n_loads++] = slot;
++            }
++            p->n_loads = new_n_loads;
++            // Dropped slots must also leave missing_mask: the pending-load
++            // install walk expects every missing bit to resolve to a loaded
++            // entry. ds4_gpu_routed_moe_one_tensor tracks the drop set
++            // separately (prefetch_dropped_mask) and does its own alias and
++            // weight handling.
++            p->missing_mask &= ~p->dropped_mask;
++        }
++    }
+     if (p->n_loads == 0) return 1;
+ 
+     const uint32_t cache_budget =
+@@ -17221,7 +17565,8 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
+ static void ds4_gpu_glm_stream_selected_prefetch_set(
+         const ds4_gpu_stream_expert_table *table,
+         const int32_t                     *selected_ids,
+-        uint32_t                           n_selected) {
++        uint32_t                           n_selected,
++        uint32_t                           dropped_mask) {
+     g_glm_stream_selected_prefetch.active = 0;
+     if (!table || !selected_ids ||
+         n_selected == 0 ||
+@@ -17241,6 +17586,7 @@ static void ds4_gpu_glm_stream_selected_prefetch_set(
+     for (uint32_t i = 0; i < n_selected; i++) {
+         g_glm_stream_selected_prefetch.selected_ids[i] = selected_ids[i];
+     }
++    g_glm_stream_selected_prefetch.dropped_mask = dropped_mask;
+     g_glm_stream_selected_prefetch.active = 1;
+ }
+ 
+@@ -17255,7 +17601,8 @@ static int ds4_gpu_glm_stream_selected_prefetch_take(
+         uint64_t    down_offset,
+         uint64_t    gate_expert_bytes,
+         uint64_t    down_expert_bytes,
+-        int32_t    *selected_ids_out) {
++        int32_t    *selected_ids_out,
++        uint32_t   *dropped_mask_out) {
+     if (!selected_ids_out || !g_glm_stream_selected_prefetch.active) return 0;
+     ds4_gpu_glm_stream_selected_prefetch *p = &g_glm_stream_selected_prefetch;
+     if (p->model_map != model_map ||
+@@ -17273,6 +17620,7 @@ static int ds4_gpu_glm_stream_selected_prefetch_take(
+     for (uint32_t i = 0; i < n_selected; i++) {
+         selected_ids_out[i] = p->selected_ids[i];
+     }
++    if (dropped_mask_out) *dropped_mask_out = p->dropped_mask;
+     p->active = 0;
+     return 1;
+ }
+@@ -17280,7 +17628,10 @@ static int ds4_gpu_glm_stream_selected_prefetch_take(
+ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+         const ds4_gpu_stream_expert_table *table,
+         const ds4_gpu_tensor              *selected,
+-        uint32_t                           n_selected) {
++        uint32_t                           n_selected,
++        // The router's weights tensor, parallel to `selected`. Read only
++        // when DS4_GLM_CACHE_AWARE_MASS is set; NULL disables MASS here.
++        const ds4_gpu_tensor              *weights) {
+     g_glm_stream_selected_prefetch.active = 0;
+     if (!g_ssd_streaming_mode ||
+         getenv("DS4_METAL_DISABLE_GLM_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
+@@ -17314,6 +17665,21 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                                  0,
+                                  selected_ids,
+                                  (uint64_t)n_selected * sizeof(selected_ids[0])) != 0;
++    const float mass_p_active = ds4_glm_cache_aware_mass_p();
++    float mass_weights[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
++    const float *mass_weights_ptr = NULL;
++    if (ok && mass_p_active > 0.0f && weights != NULL) {
++        float raw_weights[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
++        if (ds4_gpu_tensor_read(weights,
++                                0,
++                                raw_weights,
++                                (uint64_t)n_selected * sizeof(raw_weights[0])) != 0) {
++            for (uint32_t i = 0; i < n_selected; i++) {
++                mass_weights[i] = raw_weights[i] / DS4_GLM_EXPERT_WEIGHT_SCALE;
++            }
++            mass_weights_ptr = mass_weights;
++        }
++    }
+     if (timing) {
+         selected_copy_ms = ds4_gpu_now_ms() - t0;
+         t0 = ds4_gpu_now_ms();
+@@ -17321,7 +17687,8 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+     if (ok) {
+         ok = ds4_gpu_stream_expert_cache_begin_selected_load(table,
+                                                              selected_ids,
+-                                                             n_selected) != 0;
++                                                             n_selected,
++                                                             mass_weights_ptr) != 0;
+     }
+     if (timing) {
+         selected_bind_ms = ds4_gpu_now_ms() - t0;
+@@ -17332,7 +17699,8 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+     if (ok) {
+         ds4_gpu_glm_stream_selected_prefetch_set(table,
+                                                  selected_ids,
+-                                                 n_selected);
++                                                 n_selected,
++                                                 g_stream_expert_pending_load.dropped_mask);
+     }
+     if (had_batch && ds4_gpu_begin_commands() == 0) ok = 0;
+     return ok;
+@@ -37961,6 +38329,12 @@ int ds4_gpu_glm_router_select_tensor(
+         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM router select")) return 0;
+     }
+ 
++    // Record the probs tensor for the DS4_GLM_SUBST=router path in
++    // ds4_gpu_routed_moe_one_tensor, only when that feature is on.
++    if (ds4_glm_subst_mode() != DS4_GLM_SUBST_OFF) {
++        ds4_glm_subst_note_router_probs(probs, n_expert);
++    }
++
+     return 1;
+ }
+ 
+@@ -38236,7 +38610,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
+                                                           down_offset,
+                                                           gate_expert_bytes,
+                                                           down_expert_bytes,
+-                                                          stream_selected_ids);
++                                                          stream_selected_ids,
++                                                          NULL /* cache-aware drop is wired only into
++                                                                  ds4_gpu_routed_moe_one_tensor */);
+             if (have_prefetched_selected) {
+                 if (had_batch && g_batch_has_work &&
+                     g_stream_expert_pending_load.active &&
+@@ -38348,7 +38724,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
+                     if (!ds4_gpu_stream_expert_cache_begin_selected_load(
+                                 &table,
+                                 stream_selected_ids,
+-                                n_expert)) {
++                                n_expert,
++                                NULL /* split-deferred preload: no cache-aware drop here */)) {
+                         stream_ok = 0;
+                     }
+                 }
+@@ -41397,6 +41774,10 @@ int ds4_gpu_routed_moe_one_tensor(
+             const char *selected_id_source = "readback";
+             bool selected_ids_available = true;
+             bool selected_exec_ids_from_host = false;
++            // Slots the early-load path already dropped (see
++            // ds4_gpu_stream_expert_pending_load.dropped_mask); valid only
++            // when selected_id_source ends up "prefetched".
++            uint32_t prefetch_dropped_mask = 0;
+             const int stream_expert_cache_size_known =
+                 ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
+                                                              down_expert_bytes);
+@@ -41496,7 +41877,7 @@ int ds4_gpu_routed_moe_one_tensor(
+                                n_total_expert, n_expert,
+                                gate_offset, up_offset, down_offset,
+                                gate_expert_bytes, down_expert_bytes,
+-                               selected_ids)) {
++                               selected_ids, &prefetch_dropped_mask)) {
+                     /* GLM already read these IDs to start loading experts.
+                      * Submit the shared expert work while the reads finish. */
+                     selected_id_source = "prefetched";
+@@ -41764,11 +42145,100 @@ int ds4_gpu_routed_moe_one_tensor(
+                     if (!ds4_gpu_stream_expert_cache_begin_selected_load(
+                                 &table,
+                                 selected_ids,
+-                                n_expert)) {
++                                n_expert,
++                                NULL /* split-deferred preload: cache-aware drop is decided
++                                        below, not in begin_selected_load */)) {
+                         if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33156);
+                         return 0;
+                     }
+                 }
++                // Cache-aware drop: decide which missing slots to drop before
++                // the cache/SSD load below, so their bytes are never read. The
++                // decision is made here, fresh, for both the "readback" and the
++                // "prefetched" selected-id sources, from the residency peeked
++                // above (stream_expert_resident_mask / stream_expert_missing_mask)
++                // and the router weights. For "prefetched", the early-load path
++                // already skipped some reads using an earlier residency snapshot;
++                // a slot kept here that early-load skipped gets a synchronous
++                // load below, so correctness is unaffected.
++                //
++                // DS4_GLM_CACHE_AWARE_MASS, when set, decides alone. Otherwise
++                // DS4_GLM_CACHE_AWARE_MIN drops missing slots ranked >= m, and
++                // DS4_GLM_CACHE_AWARE_TAU keeps a candidate whose stored weight is
++                // >= tau * DS4_GLM_EXPERT_WEIGHT_SCALE.
++                const float cache_aware_mass_p = ds4_glm_cache_aware_mass_p();
++                const uint32_t cache_aware_min = ds4_glm_cache_aware_min_m();
++                const float cache_aware_tau = ds4_glm_cache_aware_tau();
++                uint32_t cache_aware_candidates = 0;
++                const BOOL cache_aware_rank_ok =
++                    cache_aware_min != 0 && cache_aware_min < n_expert;
++                const BOOL cache_aware_base_eligible =
++                    use_stream_expert_cache &&
++                    selected_ids_available &&
++                    !use_stream_expert_split_deferred &&
++                    selected_id_source != NULL &&
++                    (cache_aware_mass_p > 0.0f || cache_aware_rank_ok);
++                uint32_t cache_aware_dropped_mask = 0;
++                const BOOL cache_aware_is_prefetched =
++                    selected_id_source != NULL &&
++                    strcmp(selected_id_source, "prefetched") == 0;
++                const BOOL cache_aware_source_ok =
++                    cache_aware_base_eligible &&
++                    selected_id_source != NULL &&
++                    (strcmp(selected_id_source, "readback") == 0 ||
++                     cache_aware_is_prefetched);
++                if (cache_aware_source_ok) {
++                    if (cache_aware_mass_p > 0.0f) {
++                        uint8_t *mass_weights_base = (uint8_t *)[weightsbuf contents];
++                        if (mass_weights_base) {
++                            float mass_w[8];
++                            for (uint32_t ci = 0; ci < n_expert && ci < 8u; ci++) {
++                                const float *wp = (const float *)(mass_weights_base +
++                                    ds4_gpu_tensor_offset(weights) +
++                                    (uint64_t)ci * sizeof(float));
++                                mass_w[ci] = *wp / DS4_GLM_EXPERT_WEIGHT_SCALE;
++                            }
++                            cache_aware_dropped_mask = ds4_glm_cache_aware_mass_select(
++                                    cache_aware_mass_p,
++                                    n_expert,
++                                    stream_expert_resident_mask,
++                                    stream_expert_missing_mask,
++                                    mass_w);
++                            cache_aware_candidates = cache_aware_dropped_mask;
++                        } else if (cache_aware_is_prefetched) {
++                            // Weights buffer unexpectedly unreadable: fall
++                            // back to the early-load decision.
++                            cache_aware_candidates =
++                                prefetch_dropped_mask & stream_expert_missing_mask;
++                            cache_aware_dropped_mask = cache_aware_candidates;
++                        }
++                    } else {
++                        for (uint32_t ci = cache_aware_min; ci < n_expert; ci++) {
++                            if ((stream_expert_missing_mask & (1u << ci)) != 0) {
++                                cache_aware_candidates |= (1u << ci);
++                            }
++                        }
++                        cache_aware_dropped_mask = cache_aware_candidates;
++                    }
++                }
++                if (cache_aware_mass_p <= 0.0f &&
++                    cache_aware_candidates != 0 && cache_aware_tau > 0.0f) {
++                    uint8_t *tau_weights_base = (uint8_t *)[weightsbuf contents];
++                    if (tau_weights_base) {
++                        const float tau_threshold =
++                            cache_aware_tau * DS4_GLM_EXPERT_WEIGHT_SCALE;
++                        for (uint32_t ci = 0; ci < n_expert; ci++) {
++                            if ((cache_aware_candidates & (1u << ci)) == 0) continue;
++                            const float *wp = (const float *)(tau_weights_base +
++                                ds4_gpu_tensor_offset(weights) +
++                                (uint64_t)ci * sizeof(float));
++                            if (*wp >= tau_threshold) {
++                                cache_aware_dropped_mask &= ~(1u << ci);
++                            }
++                        }
++                    }
++                }
++                stream_expert_missing_mask &= ~cache_aware_dropped_mask;
+                 if (stream_expert_missing_mask != 0 &&
+                     !use_stream_expert_split_deferred) {
+                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(
+@@ -41800,6 +42270,178 @@ int ds4_gpu_routed_moe_one_tensor(
+                         down_slot_offsets[i] = entry->down_inner;
+                     }
+                 }
++                if (cache_aware_dropped_mask != 0) {
++                    const ds4_glm_subst_mode_t glm_subst_mode_v = ds4_glm_subst_mode();
++                    if (glm_subst_mode_v == DS4_GLM_SUBST_OFF) {
++                    ds4_gpu_stream_expert_cache_entry *alias_entry = stream_slot_entries[0];
++                    id<MTLBuffer> alias_gate_buf = gate_slot_bufs[0];
++                    NSUInteger alias_gate_off = gate_slot_offsets[0];
++                    id<MTLBuffer> alias_up_buf = up_slot_bufs[0];
++                    NSUInteger alias_up_off = up_slot_offsets[0];
++                    id<MTLBuffer> alias_down_buf = down_slot_bufs[0];
++                    NSUInteger alias_down_off = down_slot_offsets[0];
++                    if (!alias_entry || !alias_gate_buf || !alias_up_buf || !alias_down_buf) {
++                        if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: slot 0 not ready\n");
++                        return 0;
++                    }
++                    uint8_t *weights_base = (uint8_t *)[weightsbuf contents];
++                    uint8_t *selected_base = (uint8_t *)[selectedbuf contents];
++                    if (!weights_base || !selected_base) {
++                        if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: shared buffer contents unavailable\n");
++                        return 0;
++                    }
++                    const int32_t alias_id = selected_ids[0];
++                    for (uint32_t ci = 0; ci < n_expert; ci++) {
++                        if ((cache_aware_dropped_mask & (1u << ci)) == 0) continue;
++                        stream_slot_entries[ci] = alias_entry;
++                        alias_entry->use_count++;
++                        selected_ids[ci] = alias_id;
++                        stream_gate_abs_offsets[ci] = stream_gate_abs_offsets[0];
++                        stream_up_abs_offsets[ci] = stream_up_abs_offsets[0];
++                        stream_down_abs_offsets[ci] = stream_down_abs_offsets[0];
++                        gate_slot_bufs[ci] = alias_gate_buf;
++                        gate_slot_offsets[ci] = alias_gate_off;
++                        up_slot_bufs[ci] = alias_up_buf;
++                        up_slot_offsets[ci] = alias_up_off;
++                        down_slot_bufs[ci] = alias_down_buf;
++                        down_slot_offsets[ci] = alias_down_off;
++                        // Zero this slot's weight and mirror the alias id
++                        // into the selected-ids buffer. Both are shared
++                        // (CPU-writable) buffers; the router's GPU work is
++                        // already complete and the MoE kernel reading them
++                        // has not been encoded yet.
++                        float *weight_ptr = (float *)(weights_base +
++                            ds4_gpu_tensor_offset(weights) +
++                            (uint64_t)ci * sizeof(float));
++                        *weight_ptr = 0.0f;
++                        int32_t *selected_ptr = (int32_t *)(selected_base +
++                            ds4_gpu_tensor_offset(selected) +
++                            (uint64_t)ci * sizeof(int32_t));
++                        *selected_ptr = alias_id;
++                    }
++                    } else {
++                        // DS4_GLM_SUBST=router: same slot-0 alias setup as the
++                        // branch above (used as the per-slot fallback), plus a
++                        // search for a cached, unclaimed substitute per dropped
++                        // slot.
++                        ds4_gpu_stream_expert_cache_entry *alias_entry = stream_slot_entries[0];
++                        id<MTLBuffer> alias_gate_buf = gate_slot_bufs[0];
++                        NSUInteger alias_gate_off = gate_slot_offsets[0];
++                        id<MTLBuffer> alias_up_buf = up_slot_bufs[0];
++                        NSUInteger alias_up_off = up_slot_offsets[0];
++                        id<MTLBuffer> alias_down_buf = down_slot_bufs[0];
++                        NSUInteger alias_down_off = down_slot_offsets[0];
++                        if (!alias_entry || !alias_gate_buf || !alias_up_buf || !alias_down_buf) {
++                            if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: slot 0 not ready\n");
++                            return 0;
++                        }
++                        uint8_t *weights_base = (uint8_t *)[weightsbuf contents];
++                        uint8_t *selected_base = (uint8_t *)[selectedbuf contents];
++                        if (!weights_base || !selected_base) {
++                            if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: cache-aware drop: shared buffer contents unavailable\n");
++                            return 0;
++                        }
++                        const int32_t alias_id = selected_ids[0];
++
++                        // Substitution engages only on a single, unsplit expert
++                        // range; otherwise every dropped slot takes the fallback.
++                        const BOOL subst_single_gpu_ok =
++                            (first_expert == 0 && n_bind_expert == n_total_expert);
++                        const float *subst_probs =
++                            (glm_subst_mode_v == DS4_GLM_SUBST_ROUTER && subst_single_gpu_ok) ?
++                                ds4_glm_subst_router_probs_ptr(n_total_expert) : NULL;
++
++                        int32_t claimed_ids[DS4_METAL_MAX_ROUTED_EXPERT_USED * 2];
++                        uint32_t n_claimed = 0;
++                        for (uint32_t i = 0; i < n_expert; i++) {
++                            claimed_ids[n_claimed++] = selected_ids[i];
++                        }
++
++                        for (uint32_t ci = 0; ci < n_expert; ci++) {
++                            if ((cache_aware_dropped_mask & (1u << ci)) == 0) continue;
++                            int32_t best_id = -1;
++                            float best_prob = -1.0f;
++                            ds4_gpu_stream_expert_cache_entry *best_entry = NULL;
++                            uint64_t best_gate_abs = 0, best_up_abs = 0, best_down_abs = 0;
++                            if (subst_probs) {
++                                for (uint32_t cand = 0; cand < n_total_expert; cand++) {
++                                    BOOL claimed = NO;
++                                    for (uint32_t k = 0; k < n_claimed; k++) {
++                                        if (claimed_ids[k] == (int32_t)cand) { claimed = YES; break; }
++                                    }
++                                    if (claimed) continue;
++                                    const float p = subst_probs[cand];
++                                    if (p <= best_prob) continue;
++                                    const uint64_t cand_gate_rel = (uint64_t)cand * gate_expert_bytes;
++                                    const uint64_t cand_down_rel = (uint64_t)cand * down_expert_bytes;
++                                    const uint64_t cand_gate_abs = gate_offset + cand_gate_rel;
++                                    const uint64_t cand_up_abs = up_offset + cand_gate_rel;
++                                    const uint64_t cand_down_abs = down_offset + cand_down_rel;
++                                    ds4_gpu_stream_expert_cache_entry *entry =
++                                        ds4_gpu_stream_expert_cache_peek(model_map,
++                                                                         model_size,
++                                                                         layer_index,
++                                                                         cand,
++                                                                         n_total_expert,
++                                                                         n_expert,
++                                                                         cand_gate_abs,
++                                                                         cand_up_abs,
++                                                                         cand_down_abs,
++                                                                         gate_expert_bytes,
++                                                                         down_expert_bytes);
++                                    if (!entry) continue;
++                                    best_id = (int32_t)cand;
++                                    best_prob = p;
++                                    best_entry = entry;
++                                    best_gate_abs = cand_gate_abs;
++                                    best_up_abs = cand_up_abs;
++                                    best_down_abs = cand_down_abs;
++                                }
++                            }
++                            float *weight_ptr = (float *)(weights_base +
++                                ds4_gpu_tensor_offset(weights) +
++                                (uint64_t)ci * sizeof(float));
++                            int32_t *selected_ptr = (int32_t *)(selected_base +
++                                ds4_gpu_tensor_offset(selected) +
++                                (uint64_t)ci * sizeof(int32_t));
++                            if (best_id >= 0 && best_entry) {
++                                claimed_ids[n_claimed++] = best_id;
++                                stream_slot_entries[ci] = best_entry;
++                                best_entry->use_count++;
++                                selected_ids[ci] = best_id;
++                                stream_gate_abs_offsets[ci] = best_gate_abs;
++                                stream_up_abs_offsets[ci] = best_up_abs;
++                                stream_down_abs_offsets[ci] = best_down_abs;
++                                gate_slot_bufs[ci] = best_entry->gate_buffer;
++                                gate_slot_offsets[ci] = best_entry->gate_inner;
++                                up_slot_bufs[ci] = best_entry->up_buffer;
++                                up_slot_offsets[ci] = best_entry->up_inner;
++                                down_slot_bufs[ci] = best_entry->down_buffer;
++                                down_slot_offsets[ci] = best_entry->down_inner;
++                                *selected_ptr = best_id;
++                                // The dropped slot's own normalized weight is
++                                // left in place for the substitute.
++                            } else {
++                                // No cached, unclaimed candidate: alias to slot 0
++                                // with weight 0, as in the branch above.
++                                stream_slot_entries[ci] = alias_entry;
++                                alias_entry->use_count++;
++                                selected_ids[ci] = alias_id;
++                                stream_gate_abs_offsets[ci] = stream_gate_abs_offsets[0];
++                                stream_up_abs_offsets[ci] = stream_up_abs_offsets[0];
++                                stream_down_abs_offsets[ci] = stream_down_abs_offsets[0];
++                                gate_slot_bufs[ci] = alias_gate_buf;
++                                gate_slot_offsets[ci] = alias_gate_off;
++                                up_slot_bufs[ci] = alias_up_buf;
++                                up_slot_offsets[ci] = alias_up_off;
++                                down_slot_bufs[ci] = alias_down_buf;
++                                down_slot_offsets[ci] = alias_down_off;
++                                *weight_ptr = 0.0f;
++                                *selected_ptr = alias_id;
++                            }
++                        }
++                    }
++                }
+                 if (use_iq2_stream_addr_table && use_stream_expert_addr_table) {
+                     for (uint32_t i = 0; i < n_expert; i++) {
+                         ds4_gpu_stream_expert_cache_entry *entry = stream_slot_entries[i];
+diff --git a/ds4_server.c b/ds4_server.c
+index 20fba30..4b169ae 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -13924,6 +13924,10 @@ decode_again:
+     dsml_decode_tracker_init(&dsml_tracker);
+     dsml_tracker.model_syntax = j->req.model_syntax;
+ 
++    // Start of this request's generation for DS4_GLM_APPROX_WARMUP_TOKENS (see
++    // ds4_metal.m). The token sampled on the first loop iteration still comes
++    // from prefill's logits.
++    ds4_glm_approx_warmup_reset();
+     server_generation_enter(s);
+     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
+            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+@@ -14014,6 +14018,10 @@ decode_again:
+             ntok = 1;
+         }
+ 
++        // This iteration's decode eval just ran (whichever branch above took
++        // it); advance the warm-up step counter.
++        ds4_glm_approx_warmup_note_step();
++
+         if (ntok == 0) {
+             finish = "error";
+             snprintf(err, sizeof(err), "decode returned no tokens");
+@@ -14257,6 +14265,15 @@ decode_again:
+     }
+     server_generation_leave(s);
+ 
++    {
++        const uint64_t warmup_forced = ds4_glm_approx_warmup_forced_this_gen();
++        if (warmup_forced > 0) {
++            server_log(DS4_LOG_DEFAULT,
++                       "ds4-server: GLM approx-warmup: forced exact for %llu decode step(s) this request (completion=%d)",
++                       (unsigned long long)warmup_forced, completion);
++        }
++    }
++
+     if (job_cancelled(j)) {
+         request_live_state_clear(s, slot);
+         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
+diff --git a/ds4_stripe.c b/ds4_stripe.c
+new file mode 100644
+index 0000000..6c3b811
+--- /dev/null
++++ b/ds4_stripe.c
+@@ -0,0 +1,859 @@
++#include "ds4_stripe.h"
++
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++/* ------------------------------------------------------------------ */
++/* Minimal JSON reader (subset: object/array/string/number/bool/null). */
++/* Only used to load our own manifest files written by                */
++/* tools/ds4_stripe_build.py -- not a general-purpose JSON library.    */
++/* ------------------------------------------------------------------ */
++
++typedef enum {
++    JV_NULL, JV_BOOL, JV_NUM, JV_STR, JV_ARR, JV_OBJ
++} ds4_jtype;
++
++typedef struct ds4_jvalue {
++    ds4_jtype type;
++    double num;
++    int boolean;
++    char *str;
++    struct ds4_jvalue **items;
++    size_t n_items;
++    char **keys;
++    struct ds4_jvalue **vals;
++    size_t n_kv;
++} ds4_jvalue;
++
++typedef struct {
++    const char *s;
++    size_t len;
++    size_t pos;
++    int error;
++} ds4_jparser;
++
++static void ds4_jv_free(ds4_jvalue *v) {
++    if (!v) return;
++    size_t i;
++    switch (v->type) {
++        case JV_STR:
++            free(v->str);
++            break;
++        case JV_ARR:
++            for (i = 0; i < v->n_items; i++) ds4_jv_free(v->items[i]);
++            free(v->items);
++            break;
++        case JV_OBJ:
++            for (i = 0; i < v->n_kv; i++) {
++                free(v->keys[i]);
++                ds4_jv_free(v->vals[i]);
++            }
++            free(v->keys);
++            free(v->vals);
++            break;
++        default:
++            break;
++    }
++    free(v);
++}
++
++static void ds4_jskip_ws(ds4_jparser *p) {
++    while (p->pos < p->len) {
++        char c = p->s[p->pos];
++        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
++            p->pos++;
++        } else {
++            break;
++        }
++    }
++}
++
++static ds4_jvalue *ds4_jv_new(ds4_jtype t) {
++    ds4_jvalue *v = (ds4_jvalue *)calloc(1, sizeof(ds4_jvalue));
++    if (v) v->type = t;
++    return v;
++}
++
++static ds4_jvalue *ds4_jparse_value(ds4_jparser *p);
++
++static char *ds4_jparse_string_raw(ds4_jparser *p) {
++    if (p->pos >= p->len || p->s[p->pos] != '"') { p->error = 1; return NULL; }
++    p->pos++;
++    size_t cap = 32, n = 0;
++    char *buf = (char *)malloc(cap);
++    if (!buf) { p->error = 1; return NULL; }
++    while (p->pos < p->len && p->s[p->pos] != '"') {
++        char c = p->s[p->pos++];
++        if (c == '\\') {
++            if (p->pos >= p->len) { p->error = 1; free(buf); return NULL; }
++            char e = p->s[p->pos++];
++            switch (e) {
++                case '"': c = '"'; break;
++                case '\\': c = '\\'; break;
++                case '/': c = '/'; break;
++                case 'n': c = '\n'; break;
++                case 't': c = '\t'; break;
++                case 'r': c = '\r'; break;
++                case 'b': c = '\b'; break;
++                case 'f': c = '\f'; break;
++                case 'u': {
++                    /* Best-effort: skip 4 hex digits, emit '?'. Manifest
++                     * paths/strings are not expected to use \u escapes. */
++                    if (p->pos + 4 > p->len) { p->error = 1; free(buf); return NULL; }
++                    p->pos += 4;
++                    c = '?';
++                    break;
++                }
++                default: c = e; break;
++            }
++        }
++        if (n + 1 >= cap) {
++            cap *= 2;
++            char *nb = (char *)realloc(buf, cap);
++            if (!nb) { free(buf); p->error = 1; return NULL; }
++            buf = nb;
++        }
++        buf[n++] = c;
++    }
++    if (p->pos >= p->len) { p->error = 1; free(buf); return NULL; }
++    p->pos++; /* closing quote */
++    buf[n] = '\0';
++    return buf;
++}
++
++static ds4_jvalue *ds4_jparse_array(ds4_jparser *p) {
++    ds4_jvalue *v = ds4_jv_new(JV_ARR);
++    p->pos++; /* '[' */
++    ds4_jskip_ws(p);
++    if (p->pos < p->len && p->s[p->pos] == ']') { p->pos++; return v; }
++    size_t cap = 4;
++    v->items = (ds4_jvalue **)malloc(cap * sizeof(ds4_jvalue *));
++    for (;;) {
++        ds4_jskip_ws(p);
++        ds4_jvalue *item = ds4_jparse_value(p);
++        if (!item || p->error) { p->error = 1; ds4_jv_free(item); return v; }
++        if (v->n_items >= cap) {
++            cap *= 2;
++            ds4_jvalue **ni = (ds4_jvalue **)realloc(v->items, cap * sizeof(ds4_jvalue *));
++            if (!ni) { p->error = 1; return v; }
++            v->items = ni;
++        }
++        v->items[v->n_items++] = item;
++        ds4_jskip_ws(p);
++        if (p->pos >= p->len) { p->error = 1; return v; }
++        if (p->s[p->pos] == ',') { p->pos++; continue; }
++        if (p->s[p->pos] == ']') { p->pos++; break; }
++        p->error = 1;
++        return v;
++    }
++    return v;
++}
++
++static ds4_jvalue *ds4_jparse_object(ds4_jparser *p) {
++    ds4_jvalue *v = ds4_jv_new(JV_OBJ);
++    p->pos++; /* '{' */
++    ds4_jskip_ws(p);
++    if (p->pos < p->len && p->s[p->pos] == '}') { p->pos++; return v; }
++    size_t cap = 4;
++    v->keys = (char **)malloc(cap * sizeof(char *));
++    v->vals = (ds4_jvalue **)malloc(cap * sizeof(ds4_jvalue *));
++    for (;;) {
++        ds4_jskip_ws(p);
++        char *key = ds4_jparse_string_raw(p);
++        if (!key || p->error) { p->error = 1; free(key); return v; }
++        ds4_jskip_ws(p);
++        if (p->pos >= p->len || p->s[p->pos] != ':') { p->error = 1; free(key); return v; }
++        p->pos++;
++        ds4_jskip_ws(p);
++        ds4_jvalue *val = ds4_jparse_value(p);
++        if (!val || p->error) { p->error = 1; free(key); ds4_jv_free(val); return v; }
++        if (v->n_kv >= cap) {
++            cap *= 2;
++            char **nk = (char **)realloc(v->keys, cap * sizeof(char *));
++            ds4_jvalue **nv = (ds4_jvalue **)realloc(v->vals, cap * sizeof(ds4_jvalue *));
++            if (!nk || !nv) { p->error = 1; return v; }
++            v->keys = nk;
++            v->vals = nv;
++        }
++        v->keys[v->n_kv] = key;
++        v->vals[v->n_kv] = val;
++        v->n_kv++;
++        ds4_jskip_ws(p);
++        if (p->pos >= p->len) { p->error = 1; return v; }
++        if (p->s[p->pos] == ',') { p->pos++; continue; }
++        if (p->s[p->pos] == '}') { p->pos++; break; }
++        p->error = 1;
++        return v;
++    }
++    return v;
++}
++
++static ds4_jvalue *ds4_jparse_value(ds4_jparser *p) {
++    ds4_jskip_ws(p);
++    if (p->pos >= p->len) { p->error = 1; return NULL; }
++    char c = p->s[p->pos];
++    if (c == '{') return ds4_jparse_object(p);
++    if (c == '[') return ds4_jparse_array(p);
++    if (c == '"') {
++        char *s = ds4_jparse_string_raw(p);
++        if (!s) return NULL;
++        ds4_jvalue *v = ds4_jv_new(JV_STR);
++        v->str = s;
++        return v;
++    }
++    if (c == 't' && p->pos + 4 <= p->len && strncmp(p->s + p->pos, "true", 4) == 0) {
++        p->pos += 4;
++        ds4_jvalue *v = ds4_jv_new(JV_BOOL);
++        v->boolean = 1;
++        return v;
++    }
++    if (c == 'f' && p->pos + 5 <= p->len && strncmp(p->s + p->pos, "false", 5) == 0) {
++        p->pos += 5;
++        ds4_jvalue *v = ds4_jv_new(JV_BOOL);
++        v->boolean = 0;
++        return v;
++    }
++    if (c == 'n' && p->pos + 4 <= p->len && strncmp(p->s + p->pos, "null", 4) == 0) {
++        p->pos += 4;
++        return ds4_jv_new(JV_NULL);
++    }
++    if (c == '-' || (c >= '0' && c <= '9')) {
++        size_t start = p->pos;
++        if (p->s[p->pos] == '-') p->pos++;
++        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
++        if (p->pos < p->len && p->s[p->pos] == '.') {
++            p->pos++;
++            while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
++        }
++        if (p->pos < p->len && (p->s[p->pos] == 'e' || p->s[p->pos] == 'E')) {
++            p->pos++;
++            if (p->pos < p->len && (p->s[p->pos] == '+' || p->s[p->pos] == '-')) p->pos++;
++            while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
++        }
++        char numbuf[64];
++        size_t n = p->pos - start;
++        if (n >= sizeof(numbuf)) { p->error = 1; return NULL; }
++        memcpy(numbuf, p->s + start, n);
++        numbuf[n] = '\0';
++        ds4_jvalue *v = ds4_jv_new(JV_NUM);
++        v->num = atof(numbuf);
++        return v;
++    }
++    p->error = 1;
++    return NULL;
++}
++
++static ds4_jvalue *ds4_jparse(const char *s, size_t len) {
++    ds4_jparser p = { s, len, 0, 0 };
++    ds4_jvalue *v = ds4_jparse_value(&p);
++    ds4_jskip_ws(&p);
++    if (p.error) { ds4_jv_free(v); return NULL; }
++    return v;
++}
++
++static const ds4_jvalue *ds4_jobj_get(const ds4_jvalue *obj, const char *key) {
++    if (!obj || obj->type != JV_OBJ) return NULL;
++    size_t i;
++    for (i = 0; i < obj->n_kv; i++) {
++        if (strcmp(obj->keys[i], key) == 0) return obj->vals[i];
++    }
++    return NULL;
++}
++
++static uint64_t ds4_jnum_u64(const ds4_jvalue *v, uint64_t defval) {
++    if (!v || v->type != JV_NUM) return defval;
++    if (v->num < 0) return defval;
++    return (uint64_t)(v->num + 0.5);
++}
++
++static uint32_t ds4_jnum_u32(const ds4_jvalue *v, uint32_t defval) {
++    uint64_t u = ds4_jnum_u64(v, (uint64_t)defval);
++    return u > UINT32_MAX ? UINT32_MAX : (uint32_t)u;
++}
++
++static const char *ds4_jstr(const ds4_jvalue *v, const char *defval) {
++    if (!v || v->type != JV_STR) return defval;
++    return v->str;
++}
++
++/* ------------------------------------------------------------------ */
++/* Manifest model.                                                     */
++/* ------------------------------------------------------------------ */
++
++#define DS4_STRIPE_MAX_PARTS 8u
++
++typedef struct {
++    uint32_t part_index;
++    uint64_t file_off;
++    uint64_t len;
++} ds4_stripe_slice_part;
++
++typedef struct {
++    uint64_t off;   /* absolute byte offset in the original GGUF */
++    uint64_t len;   /* byte length of this expert-tensor slice   */
++    uint32_t n_parts;
++    ds4_stripe_slice_part parts[DS4_STRIPE_MAX_PARTS];
++} ds4_stripe_slice;
++
++typedef struct {
++    char *file;
++    char *role; /* "sidecar" or "tail", diagnostic only */
++    int fd;
++} ds4_stripe_part;
++
++/* ---- per-part worker pool: one persistent pool per drive/part, so   */
++/* that N parts genuinely read concurrently instead of one thread      */
++/* hopping between files. ---------------------------------------------*/
++
++typedef struct ds4_stripe_join {
++    pthread_mutex_t mutex;
++    pthread_cond_t cond;
++    uint32_t remaining;
++    int all_ok;
++} ds4_stripe_join;
++
++typedef struct ds4_stripe_subtask_node {
++    uint32_t part_index;
++    uint64_t file_off;
++    uint64_t len;
++    uint8_t *dst;
++    ds4_stripe_join *join;
++    struct ds4_stripe_subtask_node *next;
++} ds4_stripe_subtask_node;
++
++typedef struct {
++    pthread_mutex_t mutex;
++    pthread_cond_t cond;
++    ds4_stripe_subtask_node *head;
++    ds4_stripe_subtask_node *tail;
++    pthread_t *threads;
++    uint32_t n_threads;
++    int shutdown;
++    int started;
++} ds4_stripe_part_pool;
++
++static ds4_stripe_part g_parts[DS4_STRIPE_MAX_PARTS];
++static uint32_t g_n_parts;
++static ds4_stripe_part_pool g_pools[DS4_STRIPE_MAX_PARTS];
++
++static ds4_stripe_slice *g_slices;
++static uint32_t g_n_slices;
++static uint64_t g_align = 16384;
++
++static int g_enabled;
++static pthread_once_t g_once = PTHREAD_ONCE_INIT;
++static pthread_mutex_t g_admin_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++static char g_last_error[512];
++
++static void ds4_stripe_set_error(const char *fmt, ...) {
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(g_last_error, sizeof(g_last_error), fmt, ap);
++    va_end(ap);
++}
++
++const char *ds4_stripe_last_error(void) {
++    return g_last_error;
++}
++
++static int ds4_stripe_pread_exact(int fd, uint64_t offset, uint64_t len,
++                                  uint8_t *dst, uint64_t *out_read) {
++    uint64_t pos = 0;
++    if (out_read) *out_read = 0;
++    if (fd < 0 || !dst) return 0;
++    while (pos < len) {
++        uint64_t rem = len - pos;
++        size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
++        ssize_t nread;
++        do {
++            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
++        } while (nread < 0 && errno == EINTR);
++        if (nread <= 0) break;
++        pos += (uint64_t)nread;
++    }
++    if (out_read) *out_read = pos;
++    return pos == len;
++}
++
++static void *ds4_stripe_pool_worker(void *arg) {
++    ds4_stripe_part_pool *pool = (ds4_stripe_part_pool *)arg;
++    for (;;) {
++        pthread_mutex_lock(&pool->mutex);
++        while (!pool->shutdown && pool->head == NULL) {
++            pthread_cond_wait(&pool->cond, &pool->mutex);
++        }
++        if (pool->shutdown && pool->head == NULL) {
++            pthread_mutex_unlock(&pool->mutex);
++            break;
++        }
++        ds4_stripe_subtask_node *node = pool->head;
++        pool->head = node->next;
++        if (!pool->head) pool->tail = NULL;
++        pthread_mutex_unlock(&pool->mutex);
++
++        node->next = NULL;
++        uint32_t part_index = node->part_index;
++        int fd = (part_index < g_n_parts) ? g_parts[part_index].fd : -1;
++        uint64_t got = 0;
++        int ok = ds4_stripe_pread_exact(fd, node->file_off, node->len, node->dst, &got);
++
++        ds4_stripe_join *join = node->join;
++        pthread_mutex_lock(&join->mutex);
++        if (!ok) join->all_ok = 0;
++        if (join->remaining > 0) join->remaining--;
++        if (join->remaining == 0) pthread_cond_signal(&join->cond);
++        pthread_mutex_unlock(&join->mutex);
++
++        free(node);
++    }
++    return NULL;
++}
++
++static uint32_t ds4_stripe_threads_per_part(void) {
++    uint32_t threads = 4;
++    const char *env = getenv("DS4_STRIPE_THREADS_PER_PART");
++    if (env && env[0]) {
++        char *end = NULL;
++        unsigned long v = strtoul(env, &end, 10);
++        if (end != env && *end == '\0' && v > 0) {
++            threads = v > 32 ? 32 : (uint32_t)v;
++        }
++    }
++    return threads;
++}
++
++static int ds4_stripe_pool_start(ds4_stripe_part_pool *pool, uint32_t n_threads) {
++    pthread_mutex_init(&pool->mutex, NULL);
++    pthread_cond_init(&pool->cond, NULL);
++    pool->head = pool->tail = NULL;
++    pool->shutdown = 0;
++    pool->n_threads = n_threads;
++    pool->threads = (pthread_t *)calloc(n_threads, sizeof(pthread_t));
++    if (!pool->threads) return 0;
++    uint32_t i;
++    for (i = 0; i < n_threads; i++) {
++        if (pthread_create(&pool->threads[i], NULL, ds4_stripe_pool_worker, pool) != 0) {
++            pool->n_threads = i;
++            return 0;
++        }
++    }
++    pool->started = 1;
++    return 1;
++}
++
++static void ds4_stripe_pool_stop(ds4_stripe_part_pool *pool) {
++    if (!pool->started) return;
++    pthread_mutex_lock(&pool->mutex);
++    pool->shutdown = 1;
++    pthread_cond_broadcast(&pool->cond);
++    pthread_mutex_unlock(&pool->mutex);
++    uint32_t i;
++    for (i = 0; i < pool->n_threads; i++) {
++        pthread_join(pool->threads[i], NULL);
++    }
++    free(pool->threads);
++    pool->threads = NULL;
++    /* drain any leftover queue (shouldn't happen once all joins waited) */
++    ds4_stripe_subtask_node *n = pool->head;
++    while (n) {
++        ds4_stripe_subtask_node *next = n->next;
++        free(n);
++        n = next;
++    }
++    pthread_mutex_destroy(&pool->mutex);
++    pthread_cond_destroy(&pool->cond);
++    memset(pool, 0, sizeof(*pool));
++}
++
++static void ds4_stripe_pool_submit(uint32_t part_index, uint64_t file_off,
++                                   uint64_t len, uint8_t *dst,
++                                   ds4_stripe_join *join) {
++    ds4_stripe_subtask_node *node =
++        (ds4_stripe_subtask_node *)malloc(sizeof(ds4_stripe_subtask_node));
++    node->part_index = part_index;
++    node->file_off = file_off;
++    node->len = len;
++    node->dst = dst;
++    node->join = join;
++    node->next = NULL;
++
++    ds4_stripe_part_pool *pool = &g_pools[part_index];
++    pthread_mutex_lock(&pool->mutex);
++    if (pool->tail) {
++        pool->tail->next = node;
++    } else {
++        pool->head = node;
++    }
++    pool->tail = node;
++    pthread_cond_signal(&pool->cond);
++    pthread_mutex_unlock(&pool->mutex);
++}
++
++/* ------------------------------------------------------------------ */
++/* Loading / teardown.                                                  */
++/* ------------------------------------------------------------------ */
++
++static void ds4_stripe_free_state_locked(void) {
++    uint32_t i;
++    for (i = 0; i < g_n_parts; i++) {
++        ds4_stripe_pool_stop(&g_pools[i]);
++        if (g_parts[i].fd >= 0) close(g_parts[i].fd);
++        free(g_parts[i].file);
++        free(g_parts[i].role);
++    }
++    memset(g_parts, 0, sizeof(g_parts));
++    memset(g_pools, 0, sizeof(g_pools));
++    g_n_parts = 0;
++    free(g_slices);
++    g_slices = NULL;
++    g_n_slices = 0;
++    g_align = 16384;
++    g_enabled = 0;
++}
++
++void ds4_stripe_reset(void) {
++    pthread_mutex_lock(&g_admin_mutex);
++    ds4_stripe_free_state_locked();
++    g_last_error[0] = '\0';
++    pthread_mutex_unlock(&g_admin_mutex);
++    /* Allow ensure_loaded() to try again (mainly relevant for tests that
++     * call pthread_once indirectly via ds4_stripe_ensure_loaded -- tests
++     * should use ds4_stripe_load_manifest() directly instead, since
++     * pthread_once cannot be re-armed portably). */
++}
++
++static int ds4_stripe_slice_cmp(const void *a, const void *b) {
++    const ds4_stripe_slice *sa = (const ds4_stripe_slice *)a;
++    const ds4_stripe_slice *sb = (const ds4_stripe_slice *)b;
++    if (sa->off < sb->off) return -1;
++    if (sa->off > sb->off) return 1;
++    return 0;
++}
++
++static char *ds4_read_whole_file(const char *path, size_t *out_len) {
++    FILE *f = fopen(path, "rb");
++    if (!f) return NULL;
++    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
++    long sz = ftell(f);
++    if (sz < 0) { fclose(f); return NULL; }
++    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
++    char *buf = (char *)malloc((size_t)sz + 1);
++    if (!buf) { fclose(f); return NULL; }
++    size_t got = fread(buf, 1, (size_t)sz, f);
++    fclose(f);
++    if (got != (size_t)sz) { free(buf); return NULL; }
++    buf[sz] = '\0';
++    if (out_len) *out_len = (size_t)sz;
++    return buf;
++}
++
++bool ds4_stripe_load_manifest(const char *path) {
++    pthread_mutex_lock(&g_admin_mutex);
++    ds4_stripe_free_state_locked();
++    g_last_error[0] = '\0';
++
++    size_t flen = 0;
++    char *text = ds4_read_whole_file(path, &flen);
++    if (!text) {
++        ds4_stripe_set_error("cannot read manifest '%s': %s", path, strerror(errno));
++        pthread_mutex_unlock(&g_admin_mutex);
++        return false;
++    }
++
++    ds4_jvalue *root = ds4_jparse(text, flen);
++    free(text);
++    if (!root || root->type != JV_OBJ) {
++        ds4_stripe_set_error("manifest '%s' is not a JSON object", path);
++        ds4_jv_free(root);
++        pthread_mutex_unlock(&g_admin_mutex);
++        return false;
++    }
++
++    g_align = ds4_jnum_u64(ds4_jobj_get(root, "align"), 16384);
++    if (g_align == 0) g_align = 1;
++
++    /* Optional source sanity check: fail closed if the recorded source
++     * file no longer matches (size mismatch => stale manifest). */
++    const ds4_jvalue *source = ds4_jobj_get(root, "source");
++    if (source) {
++        const char *spath = ds4_jstr(ds4_jobj_get(source, "path"), NULL);
++        uint64_t ssize = ds4_jnum_u64(ds4_jobj_get(source, "size"), 0);
++        if (spath && ssize) {
++            struct stat st;
++            if (stat(spath, &st) != 0) {
++                ds4_stripe_set_error("manifest source '%s' not found: %s", spath, strerror(errno));
++                ds4_jv_free(root);
++                pthread_mutex_unlock(&g_admin_mutex);
++                return false;
++            }
++            if ((uint64_t)st.st_size != ssize) {
++                ds4_stripe_set_error(
++                    "manifest source size mismatch for '%s': manifest=%llu actual=%llu (stale manifest?)",
++                    spath, (unsigned long long)ssize, (unsigned long long)st.st_size);
++                ds4_jv_free(root);
++                pthread_mutex_unlock(&g_admin_mutex);
++                return false;
++            }
++        }
++    }
++
++    const ds4_jvalue *parts = ds4_jobj_get(root, "parts");
++    if (!parts || parts->type != JV_ARR || parts->n_items == 0 ||
++        parts->n_items > DS4_STRIPE_MAX_PARTS) {
++        ds4_stripe_set_error("manifest '%s' has invalid 'parts' array", path);
++        ds4_jv_free(root);
++        pthread_mutex_unlock(&g_admin_mutex);
++        return false;
++    }
++    g_n_parts = (uint32_t)parts->n_items;
++    uint32_t threads_per_part = ds4_stripe_threads_per_part();
++    uint32_t i;
++    for (i = 0; i < g_n_parts; i++) {
++        const ds4_jvalue *pobj = parts->items[i];
++        const char *file = ds4_jstr(ds4_jobj_get(pobj, "file"), NULL);
++        const char *role = ds4_jstr(ds4_jobj_get(pobj, "role"), "sidecar");
++        if (!file) {
++            ds4_stripe_set_error("manifest '%s' part %u missing 'file'", path, i);
++            ds4_jv_free(root);
++            ds4_stripe_free_state_locked();
++            pthread_mutex_unlock(&g_admin_mutex);
++            return false;
++        }
++        g_parts[i].file = strdup(file);
++        g_parts[i].role = strdup(role);
++        g_parts[i].fd = open(file, O_RDONLY);
++        if (g_parts[i].fd < 0) {
++            ds4_stripe_set_error("manifest '%s' part %u: open('%s') failed: %s",
++                                 path, i, file, strerror(errno));
++            ds4_jv_free(root);
++            ds4_stripe_free_state_locked();
++            pthread_mutex_unlock(&g_admin_mutex);
++            return false;
++        }
++        if (!ds4_stripe_pool_start(&g_pools[i], threads_per_part)) {
++            ds4_stripe_set_error("manifest '%s' part %u: failed to start worker pool", path, i);
++            ds4_jv_free(root);
++            ds4_stripe_free_state_locked();
++            pthread_mutex_unlock(&g_admin_mutex);
++            return false;
++        }
++    }
++
++    const ds4_jvalue *slices = ds4_jobj_get(root, "slices");
++    if (!slices || slices->type != JV_ARR) {
++        ds4_stripe_set_error("manifest '%s' has invalid 'slices' array", path);
++        ds4_jv_free(root);
++        ds4_stripe_free_state_locked();
++        pthread_mutex_unlock(&g_admin_mutex);
++        return false;
++    }
++    g_n_slices = (uint32_t)slices->n_items;
++    g_slices = (ds4_stripe_slice *)calloc(g_n_slices ? g_n_slices : 1, sizeof(ds4_stripe_slice));
++    for (i = 0; i < g_n_slices; i++) {
++        const ds4_jvalue *sobj = slices->items[i];
++        ds4_stripe_slice *slice = &g_slices[i];
++        slice->off = ds4_jnum_u64(ds4_jobj_get(sobj, "off"), 0);
++        slice->len = ds4_jnum_u64(ds4_jobj_get(sobj, "len"), 0);
++        const ds4_jvalue *sparts = ds4_jobj_get(sobj, "parts");
++        if (!sparts || sparts->type != JV_ARR || sparts->n_items == 0 ||
++            sparts->n_items > DS4_STRIPE_MAX_PARTS) {
++            ds4_stripe_set_error("manifest '%s' slice %u has invalid 'parts'", path, i);
++            ds4_jv_free(root);
++            ds4_stripe_free_state_locked();
++            pthread_mutex_unlock(&g_admin_mutex);
++            return false;
++        }
++        slice->n_parts = (uint32_t)sparts->n_items;
++        uint64_t sum_len = 0;
++        uint32_t j;
++        for (j = 0; j < slice->n_parts; j++) {
++            const ds4_jvalue *spobj = sparts->items[j];
++            slice->parts[j].part_index = ds4_jnum_u32(ds4_jobj_get(spobj, "part"), 0);
++            slice->parts[j].file_off = ds4_jnum_u64(ds4_jobj_get(spobj, "file_off"), 0);
++            slice->parts[j].len = ds4_jnum_u64(ds4_jobj_get(spobj, "len"), 0);
++            sum_len += slice->parts[j].len;
++            if (slice->parts[j].part_index >= g_n_parts) {
++                ds4_stripe_set_error("manifest '%s' slice %u references unknown part %u",
++                                     path, i, slice->parts[j].part_index);
++                ds4_jv_free(root);
++                ds4_stripe_free_state_locked();
++                pthread_mutex_unlock(&g_admin_mutex);
++                return false;
++            }
++        }
++        if (sum_len != slice->len) {
++            ds4_stripe_set_error(
++                "manifest '%s' slice %u part lengths sum to %llu, expected %llu",
++                path, i, (unsigned long long)sum_len, (unsigned long long)slice->len);
++            ds4_jv_free(root);
++            ds4_stripe_free_state_locked();
++            pthread_mutex_unlock(&g_admin_mutex);
++            return false;
++        }
++    }
++    qsort(g_slices, g_n_slices, sizeof(ds4_stripe_slice), ds4_stripe_slice_cmp);
++
++    ds4_jv_free(root);
++    g_enabled = 1;
++    fprintf(stderr,
++            "ds4: stripe manifest loaded '%s' parts=%u slices=%u align=%llu threads_per_part=%u\n",
++            path, g_n_parts, g_n_slices, (unsigned long long)g_align, threads_per_part);
++    pthread_mutex_unlock(&g_admin_mutex);
++    return true;
++}
++
++static void ds4_stripe_load_from_env(void) {
++    const char *path = getenv("DS4_STRIPE_MANIFEST");
++    if (!path || !path[0]) {
++        return; /* disabled: fully official, no manifest configured */
++    }
++    if (!ds4_stripe_load_manifest(path)) {
++        fprintf(stderr, "ds4: stripe manifest load failed: %s\n", ds4_stripe_last_error());
++        fprintf(stderr, "ds4: falling back to non-striped reads of the original GGUF\n");
++    }
++}
++
++bool ds4_stripe_ensure_loaded(void) {
++    pthread_once(&g_once, ds4_stripe_load_from_env);
++    return g_enabled != 0;
++}
++
++bool ds4_stripe_enabled(void) {
++    return g_enabled != 0;
++}
++
++uint32_t ds4_stripe_slice_count(void) { return g_n_slices; }
++uint32_t ds4_stripe_part_count(void) { return g_n_parts; }
++
++/* ------------------------------------------------------------------ */
++/* The hot-path read.                                                   */
++/* ------------------------------------------------------------------ */
++
++static double ds4_stripe_now_ms(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
++}
++
++static const ds4_stripe_slice *ds4_stripe_find_slice(uint64_t offset, uint64_t len) {
++    if (!g_slices || g_n_slices == 0) return NULL;
++    /* binary search on off, then require an exact [off,len) match --
++     * every real caller (ds4_gpu_stream_expert_pread_into) always asks
++     * for a whole expert-tensor slice, never a sub-range, so exact
++     * match is both correct and the fast path. */
++    uint32_t lo = 0, hi = g_n_slices;
++    while (lo < hi) {
++        uint32_t mid = lo + (hi - lo) / 2;
++        if (g_slices[mid].off < offset) {
++            lo = mid + 1;
++        } else {
++            hi = mid;
++        }
++    }
++    if (lo < g_n_slices && g_slices[lo].off == offset && g_slices[lo].len == len) {
++        return &g_slices[lo];
++    }
++    return NULL;
++}
++
++int ds4_stripe_try_pread(uint64_t offset,
++                         uint64_t len,
++                         uint8_t *dst,
++                         uint64_t *read_bytes,
++                         double   *ms_out,
++                         int      *ok) {
++    if (ok) *ok = 0;
++    if (!g_enabled || !dst || len == 0) return 0;
++
++    const ds4_stripe_slice *slice = ds4_stripe_find_slice(offset, len);
++    if (!slice) return 0; /* not a striped range -- caller falls back */
++
++    const double t0 = ds4_stripe_now_ms();
++
++    ds4_stripe_join join;
++    pthread_mutex_init(&join.mutex, NULL);
++    pthread_cond_init(&join.cond, NULL);
++    join.remaining = slice->n_parts;
++    join.all_ok = 1;
++
++    uint64_t cum = 0;
++    uint32_t j;
++    for (j = 0; j < slice->n_parts; j++) {
++        const ds4_stripe_slice_part *sp = &slice->parts[j];
++        ds4_stripe_pool_submit(sp->part_index, sp->file_off, sp->len, dst + cum, &join);
++        cum += sp->len;
++    }
++
++    pthread_mutex_lock(&join.mutex);
++    while (join.remaining != 0) {
++        pthread_cond_wait(&join.cond, &join.mutex);
++    }
++    int all_ok = join.all_ok;
++    pthread_mutex_unlock(&join.mutex);
++    pthread_mutex_destroy(&join.mutex);
++    pthread_cond_destroy(&join.cond);
++
++    const double dt = ds4_stripe_now_ms() - t0;
++    if (ms_out) *ms_out = dt;
++    if (read_bytes) *read_bytes = all_ok ? slice->len : 0;
++    if (ok) *ok = all_ok;
++    if (!all_ok) {
++        ds4_stripe_set_error(
++            "striped read failed for offset=%llu len=%llu (%u parts)",
++            (unsigned long long)offset, (unsigned long long)len, slice->n_parts);
++    }
++    return 1;
++}
++
++/* round10 (2026-09-26, task D): per-part F_RDADVISE for a known striped
++ * slice. See ds4_stripe.h for the contract. Deliberately does NOT go
++ * through the pool/join machinery ds4_stripe_try_pread() uses -- this is
++ * a fire-and-forget kernel hint, not a read that needs a completion
++ * signal, so a plain per-part fcntl() loop is both simpler and correct. */
++int ds4_stripe_try_readahead(uint64_t offset, uint64_t len) {
++    if (!g_enabled || len == 0) return 0;
++
++    const ds4_stripe_slice *slice = ds4_stripe_find_slice(offset, len);
++    if (!slice) return 0; /* not a striped range -- caller falls back */
++
++#if defined(F_RDADVISE)
++    uint32_t j;
++    for (j = 0; j < slice->n_parts; j++) {
++        const ds4_stripe_slice_part *sp = &slice->parts[j];
++        if (sp->part_index >= g_n_parts) continue;
++        const int fd = g_parts[sp->part_index].fd;
++        if (fd < 0) continue;
++
++        uint64_t pos = sp->file_off;
++        uint64_t rem = sp->len;
++        while (rem > 0) {
++            const uint64_t chunk64 =
++                rem > (uint64_t)INT_MAX ? (uint64_t)INT_MAX : rem;
++            if (pos > (uint64_t)LLONG_MAX) break;
++
++            struct radvisory ra;
++            ra.ra_offset = (off_t)pos;
++            ra.ra_count = (int)chunk64;
++            (void)fcntl(fd, F_RDADVISE, &ra);
++
++            pos += chunk64;
++            rem -= chunk64;
++        }
++    }
++#else
++    (void)slice;
++#endif
++    return 1;
++}
+diff --git a/ds4_stripe.h b/ds4_stripe.h
+new file mode 100644
+index 0000000..9d33cea
+--- /dev/null
++++ b/ds4_stripe.h
+@@ -0,0 +1,105 @@
++#ifndef DS4_STRIPE_H
++#define DS4_STRIPE_H
++
++/*
++ * GLM-5.3 "stripe" reader: optional expert-slice striping across N drives
++ * for DS4's SSD-streaming routed-expert loader.
++ *
++ * Disabled unless DS4_STRIPE_MANIFEST points at a manifest written by
++ * tools/ds4_stripe_build.py. When disabled (or when a given byte range is
++ * not a known striped slice) every call is a fast no-op and the caller
++ * must fall back to its own plain pread of the original GGUF -- this is
++ * what keeps prefill full-layer reads and mmap'd views correct without
++ * any striping support of their own.
++ *
++ * This module is intentionally dependency-free (plain C99, pthreads,
++ * POSIX I/O only -- no Objective-C, no Metal, no Foundation) so it can be
++ * unit-tested on its own, without a GPU, without linking the rest of
++ * ds4_metal.m, and without a real GGUF file.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Idempotent, thread-safe, lazy load of DS4_STRIPE_MANIFEST (checked once
++ * via pthread_once). Returns true if striping is active after the call
++ * (a manifest was found and loaded successfully). Safe to call on every
++ * hot-path pread -- after the first call it's a single memory check. */
++bool ds4_stripe_ensure_loaded(void);
++
++/* True if striping is currently active. */
++bool ds4_stripe_enabled(void);
++
++/* Try to service a read of [offset, offset+len) -- coordinates in the
++ * *original* GGUF's byte space -- by fanning it out across the striped
++ * parts and waiting for all of them.
++ *
++ * Return value:
++ *   0 -- this exact [offset,len) range is not a known striped slice (or
++ *        striping is not active). The caller MUST fall back to its own
++ *        plain pread of the original file; the ok/read_bytes/ms_out
++ *        outputs are left untouched.
++ *   1 -- handled. ok-out tells success (1) or failure (0). On failure no
++ *        partial bytes should be trusted -- treat it exactly like any
++ *        other read failure (do not silently zero-fill).
++ *
++ * read_bytes-out and ms_out may be NULL if the caller doesn't want them.
++ */
++int ds4_stripe_try_pread(uint64_t offset,
++                         uint64_t len,
++                         uint8_t *dst,
++                         uint64_t *read_bytes,
++                         double   *ms_out,
++                         int      *ok);
++
++/* round10 (2026-09-26): readahead counterpart to ds4_stripe_try_pread(),
++ * for callers that want to hint the kernel (F_RDADVISE on Darwin; a no-op
++ * everywhere else) about an upcoming expert-slice read WITHOUT actually
++ * reading it yet. [offset, offset+len) is in the *original* GGUF's byte
++ * space, same convention as ds4_stripe_try_pread().
++ *
++ * Return value:
++ *   0 -- this exact [offset,len) range is not a known striped slice (or
++ *        striping is not active). The caller MUST fall back to its own
++ *        plain whole-range readahead of the original file.
++ *   1 -- handled: a separate F_RDADVISE was issued against each striped
++ *        part's own fd, for that part's own sub-range only, instead of
++ *        readahead-ing the whole logical range against a single file
++ *        (which would tell the OS to read bytes off ANY one drive that a
++ *        striped read never actually pulls from that drive). Always
++ *        "succeeds" in the sense of being handled -- F_RDADVISE is a
++ *        best-effort hint, not a correctness-bearing read, so individual
++ *        fcntl() failures are silently ignored exactly like
++ *        ds4_gpu_stream_expert_readahead_range() already does for the
++ *        non-striped case.
++ */
++int ds4_stripe_try_readahead(uint64_t offset, uint64_t len);
++
++/* ---- Test / diagnostics hooks (also usable by a real caller) ---- */
++
++/* Explicit load from a specific manifest path, bypassing the env var and
++ * the pthread_once guard. Returns true on success. NOT safe to call while
++ * another thread may be inside ds4_stripe_try_pread -- callers (tests)
++ * must quiesce traffic first. */
++bool ds4_stripe_load_manifest(const char *path);
++
++/* Release all resources (fds, worker threads, parsed manifest) and go
++ * back to the "disabled, not yet checked" state. Used between test
++ * cases; also NOT safe under concurrent traffic. */
++void ds4_stripe_reset(void);
++
++uint32_t ds4_stripe_slice_count(void);
++uint32_t ds4_stripe_part_count(void);
++
++/* Human-readable reason the last load/read failed, or "" if none. */
++const char *ds4_stripe_last_error(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* DS4_STRIPE_H */
+diff --git a/tools/ds4_stripe_build.py b/tools/ds4_stripe_build.py
+new file mode 100644
+index 0000000..cf85777
+--- /dev/null
++++ b/tools/ds4_stripe_build.py
+@@ -0,0 +1,481 @@
++#!/usr/bin/env python3
++"""ds4_stripe_build.py -- build/verify manifests for DS4's SSD striping.
++
++Splits each routed-expert tensor slice in a GGUF file (or, for testing, a
++synthetic "pseudo-GGUF") into N contiguous byte ranges according to given
++fractions, writes the head N-1 fractions into sidecar files on other
++drives, and lets the LAST fraction stay in place inside the original file
++(role="tail") so we never have to duplicate the drive the model already
++lives on.
++
++Real usage (GLM-5.3 Full IQ2_XXS example; check free space before building):
++
++    ds4_stripe_build.py build \\
++        --gguf /path/to/GLM-5.3-Full-IQ2_XXS.gguf \\
++        --part /path/on/second-drive/glm53.stripe.part0.bin:0.59 \\
++        --tail-fraction 0.41 \\
++        --align 16384 \\
++        --manifest /path/to/manifest.json
++    ds4_stripe_build.py verify --manifest /path/to/manifest.json
++
++Test usage (no real GGUF, no model weights read or touched):
++
++    ds4_stripe_build.py build \\
++        --source /tmp/pseudo.gguf \\
++        --synthetic 4,8,65536,65536,32768 \\
++        --part /tmp/part0.bin:0.5 \\
++        --tail-fraction 0.5 \\
++        --manifest /tmp/manifest.json
++    ds4_stripe_build.py verify --manifest /tmp/manifest.json --source /tmp/pseudo.gguf
++
++GGUF tensor-info parsing below reimplements the public GGUF binary layout
++(magic/version/kv/tensor-info section) from scratch. The parser reads tensor
++metadata only; it does not modify the source model.
++"""
++import argparse
++import hashlib
++import json
++import os
++import re
++import struct
++import sys
++import time
++
++# ---------------------------------------------------------------------
++# Minimal GGUF header parser (public binary format; independent
++# reimplementation, not copied from the reference scripts).
++# ---------------------------------------------------------------------
++
++_T_UINT8, _T_INT8, _T_UINT16, _T_INT16 = 0, 1, 2, 3
++_T_UINT32, _T_INT32, _T_FLOAT32, _T_BOOL = 4, 5, 6, 7
++_T_STRING, _T_ARRAY, _T_UINT64, _T_INT64, _T_FLOAT64 = 8, 9, 10, 11, 12
++
++_SCALAR_FMT = {
++    _T_UINT8: ("B", 1), _T_INT8: ("b", 1),
++    _T_UINT16: ("H", 2), _T_INT16: ("h", 2),
++    _T_UINT32: ("I", 4), _T_INT32: ("i", 4),
++    _T_FLOAT32: ("f", 4), _T_BOOL: ("B", 1),
++    _T_UINT64: ("Q", 8), _T_INT64: ("q", 8), _T_FLOAT64: ("d", 8),
++}
++
++GGML_TYPE_NAMES = {
++    0: "f32", 1: "f16", 2: "q4_0", 3: "q4_1", 6: "q5_0", 7: "q5_1",
++    8: "q8_0", 9: "q8_1", 10: "q2_k", 11: "q3_k", 12: "q4_k", 13: "q5_k",
++    14: "q6_k", 15: "q8_k", 16: "iq2_xxs", 17: "iq2_xs", 18: "iq3_xxs",
++    19: "iq1_s", 20: "iq4_nl", 21: "iq3_s", 22: "iq2_s", 23: "iq4_xs",
++    24: "i8", 25: "i16", 26: "i32", 27: "i64", 28: "f64", 29: "iq1_m",
++    30: "bf16",
++}
++
++# (block_elems, block_bytes) for the quant types we expect to see in
++# routed-expert tensors. Extend as needed -- production round can widen
++# this if a different quant shows up; unknown types fail loudly instead
++# of silently mis-slicing.
++_TYPE_BLOCK = {
++    "f32": (1, 4), "f16": (1, 2), "bf16": (1, 2),
++    "q8_0": (32, 34),
++    "q4_k": (256, 144), "q5_k": (256, 176), "q6_k": (256, 210),
++    "q2_k": (256, 84),
++    "iq2_xxs": (256, 66), "iq2_xs": (256, 74), "iq2_s": (256, 82),
++    "iq3_xxs": (256, 98), "iq3_s": (256, 110),
++    "iq4_nl": (32, 18), "iq4_xs": (256, 136),
++}
++
++
++class _Reader:
++    def __init__(self, data):
++        self.data = data
++        self.off = 0
++
++    def read(self, n):
++        b = self.data[self.off:self.off + n]
++        if len(b) < n:
++            raise EOFError(f"need {n} bytes at {self.off}, have {len(self.data)}")
++        self.off += n
++        return b
++
++    def u32(self):
++        return struct.unpack("<I", self.read(4))[0]
++
++    def u64(self):
++        return struct.unpack("<Q", self.read(8))[0]
++
++    def string(self):
++        n = self.u64()
++        return self.read(n).decode("utf-8", errors="replace")
++
++    def value(self, vtype):
++        if vtype == _T_STRING:
++            return self.string()
++        if vtype == _T_ARRAY:
++            atype = self.u32()
++            n = self.u64()
++            return [self.value(atype) for _ in range(n)]
++        if vtype in _SCALAR_FMT:
++            fmt, size = _SCALAR_FMT[vtype]
++            return struct.unpack("<" + fmt, self.read(size))[0]
++        raise ValueError(f"unknown GGUF value type {vtype}")
++
++
++def gguf_parse_header(path, max_bytes=256 * 1024 * 1024):
++    with open(path, "rb") as f:
++        data = f.read(max_bytes)
++    r = _Reader(data)
++    magic = r.read(4)
++    if magic != b"GGUF":
++        raise ValueError(f"{path}: not a GGUF file (magic={magic!r})")
++    version = r.u32()
++    n_tensors = r.u64()
++    n_kv = r.u64()
++    meta = {}
++    for _ in range(n_kv):
++        key = r.string()
++        vtype = r.u32()
++        meta[key] = r.value(vtype)
++    tensors = []
++    for _ in range(n_tensors):
++        name = r.string()
++        n_dims = r.u32()
++        dims = [r.u64() for _ in range(n_dims)]
++        ttype = r.u32()
++        offset = r.u64()
++        tensors.append({
++            "name": name,
++            "dims": dims,
++            "type": GGML_TYPE_NAMES.get(ttype, ttype),
++            "offset": offset,
++        })
++    return version, meta, tensors, r.off
++
++
++def data_start_offset(header_bytes_consumed, alignment=32):
++    return ((header_bytes_consumed + alignment - 1) // alignment) * alignment
++
++
++def row_bytes(ne0, gtype):
++    if gtype not in _TYPE_BLOCK:
++        raise ValueError(f"unsupported ggml type for row-byte math: {gtype}")
++    block_elems, block_bytes = _TYPE_BLOCK[gtype]
++    if ne0 % block_elems != 0:
++        raise ValueError(f"ne0={ne0} not divisible by block_elems={block_elems} for {gtype}")
++    return (ne0 // block_elems) * block_bytes
++
++
++_ROUTED_EXPERT_RE = re.compile(
++    r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
++
++
++def enumerate_routed_expert_slices_from_gguf(path):
++    """Return (source_size, list of slice dicts) for every expert in every
++    routed ffn_{gate,up,down}_exps.weight tensor. Each slice dict has:
++    off, len (absolute byte range in the GGUF file), layer, kind, expert.
++    """
++    version, meta, tensors, header_bytes = gguf_parse_header(path)
++    del version
++    alignment = int(meta.get("general.alignment", 32))
++    data_start = data_start_offset(header_bytes, alignment)
++    source_size = os.path.getsize(path)
++
++    slices = []
++    for t in tensors:
++        m = _ROUTED_EXPERT_RE.match(t["name"])
++        if not m:
++            continue
++        layer = int(m.group(1))
++        kind = m.group(2)
++        dims = t["dims"]
++        if len(dims) != 3:
++            raise ValueError(f"expected 3-D routed expert tensor, got {dims} for {t['name']}")
++        ne0, ne1, n_expert = dims
++        gtype = t["type"]
++        rb = row_bytes(ne0, gtype)
++        expert_bytes = rb * ne1
++        base = data_start + t["offset"]
++        for e in range(n_expert):
++            off = base + e * expert_bytes
++            slices.append({
++                "off": off, "len": expert_bytes,
++                "layer": layer, "kind": kind, "expert": e,
++            })
++    return source_size, slices
++
++
++def enumerate_synthetic_slices(spec, base_off=0):
++    """spec = "n_layers,n_expert,gate_bytes,up_bytes,down_bytes" laid out
++    back-to-back starting at base_off, mimicking the real per-layer
++    ffn_{gate,up,down}_exps.weight container-tensor layout closely enough
++    to exercise the same slicing/striping code paths without a real GGUF.
++    """
++    n_layers, n_expert, gate_bytes, up_bytes, down_bytes = (int(x) for x in spec.split(","))
++    slices = []
++    cursor = base_off
++    for layer in range(n_layers):
++        for kind, per_expert_bytes in (("gate", gate_bytes), ("up", up_bytes), ("down", down_bytes)):
++            for e in range(n_expert):
++                slices.append({
++                    "off": cursor, "len": per_expert_bytes,
++                    "layer": layer, "kind": kind, "expert": e,
++                })
++                cursor += per_expert_bytes
++    return cursor, slices  # cursor == total bytes consumed
++
++
++# ---------------------------------------------------------------------
++# Striping math + manifest / sidecar writer.
++# ---------------------------------------------------------------------
++
++def plan_stripe(slice_len, fractions, align):
++    """Split [0, slice_len) into len(fractions) consecutive chunks whose
++    boundaries are rounded to multiples of `align`, in fraction order.
++    The last chunk absorbs any rounding remainder. Returns a list of
++    (local_off, local_len) covering [0, slice_len) with no gaps/overlaps.
++    """
++    n = len(fractions)
++    assert n >= 1
++    if slice_len == 0:
++        return [(0, 0)] * n
++    boundaries = [0]
++    acc = 0.0
++    for f in fractions[:-1]:
++        acc += f
++        raw = int(round(slice_len * acc))
++        if align > 1:
++            raw = (raw // align) * align
++        raw = max(boundaries[-1], min(raw, slice_len))
++        boundaries.append(raw)
++    boundaries.append(slice_len)
++    chunks = []
++    for i in range(n):
++        lo, hi = boundaries[i], boundaries[i + 1]
++        chunks.append((lo, hi - lo))
++    return chunks
++
++
++def build_manifest(source_path, source_size, slices, part_specs, align,
++                    manifest_path, source_mtime=None, sha_head=None):
++    """part_specs: list of dicts, each {"file": path, "fraction": float,
++    "tail": bool}. Exactly the last entry may have tail=True, meaning it
++    reads straight out of source_path at the slice's own natural offset
++    (no sidecar file is written for it).
++    """
++    n_parts = len(part_specs)
++    fractions = [p["fraction"] for p in part_specs]
++    total_frac = sum(fractions)
++    if abs(total_frac - 1.0) > 1e-6:
++        raise ValueError(f"fractions must sum to 1.0, got {total_frac}")
++
++    tail_indices = [i for i, p in enumerate(part_specs) if p.get("tail")]
++    if len(tail_indices) > 1:
++        raise ValueError("at most one part may be role=tail")
++    tail_index = tail_indices[0] if tail_indices else None
++    if tail_index is not None and tail_index != n_parts - 1:
++        raise ValueError("the tail part must be the last part")
++
++    sidecar_fds = {}
++    sidecar_cursors = {}
++    for i, p in enumerate(part_specs):
++        if i == tail_index:
++            continue
++        os.makedirs(os.path.dirname(os.path.abspath(p["file"])) or ".", exist_ok=True)
++        sidecar_fds[i] = open(p["file"], "wb")
++        sidecar_cursors[i] = 0
++
++    with open(source_path, "rb") as src:
++        manifest_slices = []
++        for s in slices:
++            chunks = plan_stripe(s["len"], fractions, align)
++            parts_out = []
++            local_cursor = 0
++            for i, (local_off, local_len) in enumerate(chunks):
++                if i == tail_index:
++                    file_off = s["off"] + local_off
++                    parts_out.append({"part": i, "file_off": file_off, "len": local_len})
++                else:
++                    if local_len > 0:
++                        src.seek(s["off"] + local_off)
++                        buf = src.read(local_len)
++                        if len(buf) != local_len:
++                            raise IOError(f"short read building sidecar for slice off={s['off']}")
++                        sidecar_fds[i].write(buf)
++                    file_off = sidecar_cursors[i]
++                    sidecar_cursors[i] += local_len
++                    parts_out.append({"part": i, "file_off": file_off, "len": local_len})
++                local_cursor += local_len
++            assert local_cursor == s["len"]
++            manifest_slices.append({
++                "off": s["off"], "len": s["len"],
++                "layer": s.get("layer"), "kind": s.get("kind"), "expert": s.get("expert"),
++                "parts": parts_out,
++            })
++
++    for fd in sidecar_fds.values():
++        fd.close()
++
++    parts_manifest = []
++    for i, p in enumerate(part_specs):
++        entry = {"index": i, "file": os.path.abspath(p["file"]) if i != tail_index else os.path.abspath(source_path)}
++        if i == tail_index:
++            entry["role"] = "tail"
++        else:
++            entry["role"] = "sidecar"
++        entry["fraction"] = p["fraction"]
++        parts_manifest.append(entry)
++
++    manifest = {
++        "version": 1,
++        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
++        "source": {
++            "path": os.path.abspath(source_path),
++            "size": source_size,
++        },
++        "align": align,
++        "parts": parts_manifest,
++        "slices": manifest_slices,
++    }
++    if source_mtime is not None:
++        manifest["source"]["mtime"] = source_mtime
++    if sha_head is not None:
++        manifest["source"]["sha256_head_1mib"] = sha_head
++
++    os.makedirs(os.path.dirname(os.path.abspath(manifest_path)) or ".", exist_ok=True)
++    with open(manifest_path, "w") as f:
++        json.dump(manifest, f)
++    return manifest
++
++
++def sha256_head(path, n=1024 * 1024):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        h.update(f.read(n))
++    return h.hexdigest()
++
++
++def verify_manifest(manifest_path, sample=None, seed=0):
++    with open(manifest_path, "r") as f:
++        manifest = json.load(f)
++
++    part_fds = {}
++    for p in manifest["parts"]:
++        part_fds[p["index"]] = open(p["file"], "rb")
++
++    source_path = manifest["source"]["path"]
++    src = open(source_path, "rb")
++
++    slices = manifest["slices"]
++    indices = range(len(slices))
++    if sample is not None and sample < len(slices):
++        import random
++        rnd = random.Random(seed)
++        indices = sorted(rnd.sample(range(len(slices)), sample))
++
++    n_checked = 0
++    n_bytes = 0
++    first_mismatch = None
++    for idx in indices:
++        s = slices[idx]
++        src.seek(s["off"])
++        expected = src.read(s["len"])
++        got = bytearray()
++        for part in s["parts"]:
++            fd = part_fds[part["part"]]
++            fd.seek(part["file_off"])
++            chunk = fd.read(part["len"])
++            if len(chunk) != part["len"]:
++                first_mismatch = first_mismatch or (idx, "short-read", part)
++            got.extend(chunk)
++        if bytes(got) != expected:
++            if first_mismatch is None:
++                # find first differing byte for a useful report
++                diff_at = next((i for i in range(min(len(got), len(expected))) if got[i] != expected[i]), min(len(got), len(expected)))
++                first_mismatch = (idx, "byte-mismatch", diff_at)
++        n_checked += 1
++        n_bytes += s["len"]
++
++    src.close()
++    for fd in part_fds.values():
++        fd.close()
++
++    return {
++        "slices_checked": n_checked,
++        "bytes_checked": n_bytes,
++        "total_slices": len(slices),
++        "ok": first_mismatch is None,
++        "first_mismatch": first_mismatch,
++    }
++
++
++# ---------------------------------------------------------------------
++# CLI
++# ---------------------------------------------------------------------
++
++def _parse_part_arg(s):
++    path, frac = s.rsplit(":", 1)
++    return {"file": path, "fraction": float(frac)}
++
++
++def cmd_build(args):
++    part_specs = [_parse_part_arg(p) for p in args.part]
++    part_specs.append({"file": args.source or args.gguf, "fraction": args.tail_fraction, "tail": True})
++
++    if args.gguf:
++        source_size, slices = enumerate_routed_expert_slices_from_gguf(args.gguf)
++        source_path = args.gguf
++    else:
++        if not args.source or not args.synthetic:
++            print("error: --synthetic mode needs both --source and --synthetic", file=sys.stderr)
++            return 2
++        total_needed, slices = enumerate_synthetic_slices(args.synthetic, base_off=args.synthetic_base)
++        source_path = args.source
++        actual_size = os.path.getsize(source_path)
++        if total_needed > actual_size:
++            print(f"error: synthetic layout needs {total_needed} bytes but {source_path} is only {actual_size}", file=sys.stderr)
++            return 2
++        source_size = actual_size
++
++    st = os.stat(source_path)
++    manifest = build_manifest(
++        source_path, source_size, slices, part_specs, args.align,
++        args.manifest, source_mtime=int(st.st_mtime),
++        sha_head=sha256_head(source_path))
++    print(f"wrote manifest {args.manifest}: parts={len(manifest['parts'])} slices={len(manifest['slices'])}")
++    for p in manifest["parts"]:
++        extra = ""
++        if p["role"] != "tail":
++            sz = os.path.getsize(p["file"])
++            extra = f" sidecar_bytes={sz}"
++        print(f"  part[{p['index']}] role={p['role']} fraction={p['fraction']:.4f} file={p['file']}{extra}")
++    return 0
++
++
++def cmd_verify(args):
++    result = verify_manifest(args.manifest, sample=args.sample)
++    print(json.dumps(result, indent=2))
++    return 0 if result["ok"] else 1
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    sub = ap.add_subparsers(dest="cmd", required=True)
++
++    b = sub.add_parser("build", help="build a stripe manifest + sidecars")
++    b.add_argument("--gguf", help="real GGUF file to enumerate routed experts from")
++    b.add_argument("--source", help="pseudo-GGUF file for --synthetic mode (also the tail part's file)")
++    b.add_argument("--synthetic", help="n_layers,n_expert,gate_bytes,up_bytes,down_bytes")
++    b.add_argument("--synthetic-base", type=int, default=0, help="byte offset where the synthetic layout starts")
++    b.add_argument("--part", action="append", default=[], help="PATH:FRACTION, repeatable, one per non-tail part, in drive order")
++    b.add_argument("--tail-fraction", type=float, required=True, help="fraction of each slice left in place in the source file")
++    b.add_argument("--align", type=int, default=16384)
++    b.add_argument("--manifest", required=True)
++    b.set_defaults(func=cmd_build)
++
++    v = sub.add_parser("verify", help="verify a manifest's sidecars reconstruct the source bytes exactly")
++    v.add_argument("--manifest", required=True)
++    v.add_argument("--sample", type=int, default=None, help="check a random sample of N slices instead of all of them")
++    v.set_defaults(func=cmd_verify)
++
++    args = ap.parse_args()
++    sys.exit(args.func(args))
++
++
++if __name__ == "__main__":
++    main()

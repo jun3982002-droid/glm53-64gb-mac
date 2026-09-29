@@ -2,14 +2,22 @@
 
 **Can a 64 GB Mac run a model whose weights are much larger than memory—and what trade-offs make it practical?**
 
-This project measures SSD-streamed inference for **GLM-5.3 Full, IQ2_XXS quantization** (196.58 GiB model file) on an Apple M4 Max with 64 GiB of unified memory. The experimental runtime is a modified [DS4](https://github.com/antirez/ds4) build. The current storage layout reads from the Mac's internal SSD and one external NVMe SSD.
+This project measures SSD-streamed inference for **GLM-5.3 Full, IQ2_XXS quantization** (196.58 GiB model file) on an Apple M4 Max with 64 GiB of unified memory. The repository includes both a one-drive patch and a consolidated two-drive fast5 patch for the [DS4](https://github.com/antirez/ds4) runtime. The two-drive patch splits only routed-expert byte ranges between an internal SSD sidecar and the external model file; it does not modify or redistribute the model.
+
+## Run it on an Apple Silicon Mac
+
+This repository includes two copyable runtime setups in [`runtime/README.md`](runtime/README.md): single-drive approximate routing, and the full fast5 two-drive version with a sidecar builder and verifier. The full GLM-5.3 Q2 model is about 197 GiB, so it is downloaded directly with DS4's model downloader and is **not** hosted here. The two-drive method and benchmark settings are documented below.
+
+Start with the [full fast5 two-drive quick start](runtime/README.md#full-fast5-quick-start-two-drive-striping) to reproduce the combined patch and striped setup, or use the [one-drive quick start](runtime/README.md#one-drive-quick-start) as the storage baseline. The full recipe pins the exact upstream DS4 revision, builds the runtime, downloads the model, creates and verifies the sidecar, and runs the included benchmark prompt.
 
 ## Selected results
 
-These are dated measurements from specific experiments, not a general performance guarantee.
+These are dated measurements from specific experiments, not a general performance guarantee. The public Japanese benchmark prompt is included at [`results/fast5-benchmark-prompt-ja.txt`](results/fast5-benchmark-prompt-ja.txt).
 
 | Experiment | Measured result | Conditions and limits |
 |---|---|---|
+| One-drive routing patch, `fast5` settings + warm-up 16, 2026-09-29 | Generation 2.56 tok/s; prefill 4.01 tok/s | M4 Max, 64 GiB, Metal, one external NVMe model drive, included Japanese benchmark prompt, 64-token limit, one run. `MIN=1`, `TAU=0.18`, MASS/substitution/next-layer prefetch unset. |
+| Consolidated full fast5 patch, matched one-/two-drive and warm-up check, 2026-09-29 | One drive: 5.58 tok/s without warm-up, 2.59 with warm-up 16. Two-drive striping: 6.78 without warm-up, 4.19 with warm-up 16. | Same M4 Max, model, public prompt, binary, `MIN=1`, `TAU=0.18`, 64-token limit; one run per cell. Two-drive uses `r=0.59`, `DS4_STRIPE_THREADS_PER_PART=4`, and stripe-aware readahead. Prefill was 3.99 / 3.99 tok/s (one drive) and 8.22 / 8.28 tok/s (two drives), no-warm-up/warm-up 16. Speed-only runs; output quality was not re-evaluated. Turning warm-up off can expose a known rare derailment. |
 | `jevq6s` decode, 2026-09-28 | 3.62 / 3.59 tok/s across two runs; exact measured about 2.1 tok/s | Experimental approximate mode combining cache-aware MASS, resident-expert substitution, and next-layer prefetch. In separate NLL evaluations, +2.06% vs exact on one Japanese text (959 tokens scored) and +2.03% on another (2,222 tokens scored). These two texts do not establish general response quality. |
 | Exact vs. `fast4s` decode, 2026-09-27 | 1.955 vs. 5.555 generated tokens/s (2.84× ratio of the two-run means) | Same fixed Japanese prompt, 64 generated tokens, 2 runs per mode. `fast4s` is approximate; it substitutes already-resident experts for selected cache-missing experts. This is not an apples-to-apples quality comparison. |
 | `fast4p` prefill, 2026-09-27 | 4.535 → 5.785 input tokens/s (+27.56%); decode stayed at 5.59 → 5.615 output tokens/s | 95-token input, two paired runs. `fast4p` changes prefill behavior while retaining the `fast4s` decode configuration. |
@@ -26,7 +34,7 @@ These are dated measurements from specific experiments, not a general performanc
 
 ## Choose a mode
 
-The experimental launcher already accepts these modes by name on the test machine. This repository does not yet include the launcher or modified runtime, so the table is a guide to measured choices, not a runnable download.
+The experimental launcher accepted these modes by name on the test machine. The repository includes a single-drive routing patch and a consolidated two-drive fast5 patch; the full development launcher is not included. The `fast5` settings and reproducible two-drive setup are in [`runtime/README.md`](runtime/README.md).
 
 | Mode | Decode speed | NLL difference vs. exact | When to choose |
 |---|---:|---:|---|
@@ -35,11 +43,13 @@ The experimental launcher already accepts these modes by name on the test machin
 | `jevq5s` | ~3.8 tok/s | +3.69% / +3.81% on the same two texts | A little more speed, with a larger measured NLL difference in those texts. |
 | `fast4q` | ~4.5 tok/s | +4.5% in the reported evaluation | Middle-speed option. |
 | `fast4s` | 5.3–5.5 tok/s | +5.98% on one 991-token text (959 scored) | Choose when decode speed matters more. |
-| `fast5` | ~6.7 tok/s | +21.48% on one 991-token text (959 scored) | Highest measured speed in this set; not recommended as the default because of the larger measured NLL difference. |
+| `fast5` | 6.78 tok/s in the two-drive, no-warm-up run; 4.19 with warm-up 16 | +21.48% on one 991-token text (959 scored) | `MIN=1`, `TAU=0.18`, no MASS, substitution, or next-layer prefetch; two-drive patch with `r=0.59`. NLL is from a separate evaluation. The no-warm-up speed is experimental and can expose a known rare derailment. |
 
-These are project snapshots from different runs and evaluation conditions, not a single apples-to-apples benchmark. NLL is a language-modeling metric, not a percentage score for answer quality or accuracy; the text evaluations are small. `fast5` is distinct from `fast5s`, a separate experimental mode that was withdrawn after a malformed-output check.
+The matched check above uses the same consolidated patch with the manifest unset for one drive and set for two-drive striping. With the included prompt, striping measured 6.78 tok/s without warm-up and 4.19 with warm-up 16, versus 5.58 and 2.59 on one drive. Each cell was measured once. The separate one-drive patch does not include striping; apply the consolidated patch to reproduce the two-drive procedure.
 
-The speeds in this table were measured before a start-of-answer safeguard was added. The launcher now runs the first 16 decode steps of each answer exactly in the approximate modes on the patched runtime (`fast4p` runs on a separate binary and is not covered). This lowers speed mostly for short answers. On 64-token answers, it cost about 15% for `jevq6s` and 30% for `fast4s` (one run each: 3.85 → 3.28 and 5.54 → 3.88 tok/s). The 3.85 differs from the ~3.6 in the table: with the same settings, `jevq6s` measured 3.59–3.62 tok/s in an earlier session and 3.85–3.86 tok/s in a later one, and the cause of that gap was not found.
+These are project snapshots from different runs and evaluation conditions, not a single apples-to-apples benchmark. NLL is a language-modeling metric, not a percentage score for answer quality or accuracy; the text evaluations are small.
+
+The speeds in this table were measured before a start-of-answer safeguard was added. The runtime patch can run the first 16 decode steps exactly, then resume approximation. In the matched `fast5` check above, warm-up reduced speed from 5.58 to 2.59 tok/s on one drive and from 6.78 to 4.19 tok/s with two-drive striping (one run per cell). It is a safety/performance tradeoff; disabling it can expose a known rare derailment. On other 64-token runs, the same warm-up cost about 15% for `jevq6s` and 30% for `fast4s` (one run each: 3.85 → 3.28 and 5.54 → 3.88 tok/s). The 3.85 differs from the ~3.6 in the table: with the same settings, `jevq6s` measured 3.59–3.62 tok/s in an earlier session and 3.85–3.86 tok/s in a later one, and the cause of that gap was not found.
 
 ## How the approximation works
 
@@ -65,7 +75,7 @@ Before treating a number as comparable, check its date, model quantization, prom
 
 This is a single-machine research project. Hardware, model quantization, short evaluation texts, and a small set of prompt checks limit what can be concluded. Higher SSD bandwidth may not improve end-to-end inference if another part of the runtime becomes the bottleneck.
 
-This repository currently publishes experiment summaries and, for the 2026-09-28 model comparison, the question sets ([results/eval-sets/](results/eval-sets/)). It does not yet include the modified runtime source or reproduction scripts; those are being prepared separately. Before publishing them, I will identify the exact upstream revision, review the patch and bundled notices, and remove private paths or prompts from any logs.
+This repository publishes experiment summaries, the 2026-09-28 evaluation question sets ([results/eval-sets/](results/eval-sets/)), a single-drive runtime patch, and a consolidated two-drive fast5 patch with a sidecar builder, verifier, and setup recipe ([runtime/](runtime/)). It does not include model weights, generated sidecars/manifests, or the experiment launcher. Both patches target a pinned upstream revision and include their setup, checks, and limitations.
 
 ### Credits
 
