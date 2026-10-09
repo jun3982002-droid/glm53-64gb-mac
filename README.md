@@ -10,6 +10,13 @@ This repository includes two copyable runtime setups in [`runtime/README.md`](ru
 
 Start with the [full fast5 two-drive quick start](runtime/README.md#full-fast5-quick-start-two-drive-striping) to reproduce the combined patch and striped setup, or use the [one-drive quick start](runtime/README.md#one-drive-quick-start) as the storage baseline. The full recipe pins the exact upstream DS4 revision, builds the runtime, downloads the model, creates and verifies the sidecar, and runs the included benchmark prompt.
 
+## Recent DeepSeek V4.1 Flash decode results (2026-10-09)
+
+- **93,030-token DS4 benchmark:** across completed runs with a 34 GB cache, 512-token decode averaged 15.11–15.26 tok/s; the fastest run reached 15.37 tok/s in its steady-state portion.
+- **Repeated-output trial:** a separate API request with 22,034 prompt tokens and 2,048 generated tokens reached a peak of **17.39 tok/s in a rolling 50-token window**. The full decode measured 15.93 tok/s in the server log and 15.35 tok/s at the client. The request ended at its token limit while generating in the reasoning channel, without the requested visible output; this is speed evidence, not an answer-quality result.
+
+These are different prompts and measurement paths. The 17.39 tok/s figure is the highest short-window speed observed in the repeated-output trial, not the 93k benchmark average.
+
 ## Selected results
 
 These are dated measurements from specific experiments, not a general performance guarantee. The public Japanese benchmark prompt is included at [`results/fast5-benchmark-prompt-ja.txt`](results/fast5-benchmark-prompt-ja.txt).
